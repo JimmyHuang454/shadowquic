@@ -188,14 +188,17 @@ pub struct ShadowQuicClientCfg {
     #[serde(default = "default_over_stream")]
     pub over_stream: bool,
     #[serde(default = "default_min_mtu")]
-    /// Minimum mtu, must be smaller than initial mtu, at least to be 1200.
-    /// 1400 is recommended for high packet loss network. default to be 1290
     pub min_mtu: u16,
     /// Keep alive interval in milliseconds
     /// 0 means disable keep alive, should be smaller than 30_000(idle time).
     /// Disabled by default.
     #[serde(default = "default_keep_alive_interval")]
     pub keep_alive_interval: u32,
+
+    /// Port hopping configuration
+    /// Randomly select a port from the list or range to connect to.
+    /// Range format: "start-end" e.g. "1000-2000"
+    pub port_hopping: Option<PortHopping>,
 
     /// Android Only. the unix socket path for protecting android socket
     #[cfg(target_os = "android")]
@@ -216,6 +219,7 @@ impl Default for ShadowQuicClientCfg {
             over_stream: Default::default(),
             min_mtu: default_min_mtu(),
             keep_alive_interval: default_keep_alive_interval(),
+            port_hopping: None,
             #[cfg(target_os = "android")]
             protect_path: Default::default(),
         }
@@ -282,6 +286,30 @@ pub enum DnsStrategy {
     Ipv6Only,
 }
 
+#[derive(Deserialize, Clone, Debug)]
+#[serde(untagged)]
+pub enum PortHopping {
+    Range(String),
+    List(Vec<u16>),
+}
+
+impl PortHopping {
+    pub fn get_ports(&self) -> Vec<u16> {
+        match self {
+            PortHopping::List(v) => v.clone(),
+            PortHopping::Range(s) => {
+                let parts: Vec<&str> = s.split('-').collect();
+                if parts.len() != 2 {
+                    return vec![];
+                }
+                let start = parts[0].parse::<u16>().unwrap_or(0);
+                let end = parts[1].parse::<u16>().unwrap_or(0);
+                (start..=end).collect()
+            }
+        }
+    }
+}
+
 /// Configuration of shadowquic inbound
 ///
 /// Example:
@@ -330,6 +358,10 @@ pub struct ShadowQuicServerCfg {
     /// 1400 is recommended for high packet loss network. default to be 1290
     #[serde(default = "default_min_mtu")]
     pub min_mtu: u16,
+    /// Port hopping configuration
+    /// Listen on multiple ports.
+    /// Range format: "start-end" e.g. "1000-2000"
+    pub port_hopping: Option<PortHopping>,
 }
 
 /// Jls upstream configuration
@@ -363,6 +395,7 @@ impl Default for ShadowQuicServerCfg {
             initial_mtu: default_initial_mtu(),
             min_mtu: default_min_mtu(),
             server_name: None,
+            port_hopping: None,
         }
     }
 }
@@ -392,7 +425,7 @@ impl LogLevel {
 
 #[cfg(test)]
 mod test {
-    use super::Config;
+    use super::{Config, PortHopping};
     #[test]
     fn test() {
         let cfgstr = r###"
@@ -404,5 +437,55 @@ outbound:
     dns-strategy: prefer-ipv4
 "###;
         let _cfg: Config = serde_yaml::from_str(cfgstr).expect("yaml parsed failed");
+    }
+
+    #[test]
+    fn test_port_hopping() {
+        let ph = PortHopping::Range("1000-1002".to_string());
+        assert_eq!(ph.get_ports(), vec![1000, 1001, 1002]);
+
+        let ph = PortHopping::List(vec![80, 443]);
+        assert_eq!(ph.get_ports(), vec![80, 443]);
+    }
+
+    #[test]
+    fn test_port_hopping_yaml() {
+        let cfgstr = r###"
+inbound:
+    type: shadowquic
+    bind-addr: 127.0.0.1:443
+    port-hopping: "1000-1002"
+    users: []
+    jls-upstream:
+        addr: "google.com:443"
+outbound:
+    type: shadowquic
+    addr: "127.0.0.1:443"
+    port-hopping: [1000, 1001]
+    username: "u"
+    password: "p"
+    server-name: "s"
+"###;
+        let cfg: Config = serde_yaml::from_str(cfgstr).expect("yaml parsed failed");
+
+        if let super::InboundCfg::ShadowQuic(sq) = cfg.inbound {
+            assert!(sq.port_hopping.is_some());
+            match sq.port_hopping.unwrap() {
+                PortHopping::Range(s) => assert_eq!(s, "1000-1002"),
+                _ => panic!("Expected Range"),
+            }
+        } else {
+            panic!("Expected ShadowQuic inbound");
+        }
+
+        if let super::OutboundCfg::ShadowQuic(sq) = cfg.outbound {
+            assert!(sq.port_hopping.is_some());
+            match sq.port_hopping.unwrap() {
+                PortHopping::List(l) => assert_eq!(l, vec![1000, 1001]),
+                _ => panic!("Expected List"),
+            }
+        } else {
+            panic!("Expected ShadowQuic outbound");
+        }
     }
 }

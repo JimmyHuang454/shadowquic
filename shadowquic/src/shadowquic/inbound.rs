@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use bytes::Bytes;
+use std::net::SocketAddr;
 use std::{pin::Pin, sync::Arc};
 
 use tokio::{
@@ -77,27 +78,51 @@ impl Inbound for ShadowQuicServer {
     async fn init(&self) -> Result<(), SError> {
         let request_sender = self.request_sender.clone();
         let config = self.config.clone();
-        let fut = async move {
-            let endpoint: EndServer = QuicServer::new(&config)
-                .await
-                .expect("Failed to listening on udp");
-            loop {
-                match QuicServer::accept(&endpoint).await {
-                    Ok(conn) => {
-                        let request_sender = request_sender.clone();
-                        tokio::spawn(async move {
-                            Self::handle_incoming(conn, request_sender)
-                                .await
-                                .map_err(|x| error!("{}", x))
-                        });
-                    }
+
+        let mut configs = vec![config.clone()];
+
+        if let Some(ph) = &config.port_hopping {
+            let ports = ph.get_ports();
+            let bind_ip = config.bind_addr.ip();
+            for port in ports {
+                if port == config.bind_addr.port() {
+                    continue;
+                }
+                let mut c = config.clone();
+                c.bind_addr = SocketAddr::new(bind_ip, port);
+                configs.push(c);
+            }
+        }
+
+        for cfg in configs {
+            let request_sender = request_sender.clone();
+            let fut = async move {
+                let endpoint: EndServer = match QuicServer::new(&cfg).await {
+                    Ok(e) => e,
                     Err(e) => {
-                        error!("Error accepting quic connection: {}", e);
+                        error!("Failed to listening on udp {}: {}", cfg.bind_addr, e);
+                        return;
+                    }
+                };
+                info!("ShadowQuic listening on {}", cfg.bind_addr);
+                loop {
+                    match QuicServer::accept(&endpoint).await {
+                        Ok(conn) => {
+                            let request_sender = request_sender.clone();
+                            tokio::spawn(async move {
+                                Self::handle_incoming(conn, request_sender)
+                                    .await
+                                    .map_err(|x| error!("{}", x))
+                            });
+                        }
+                        Err(e) => {
+                            error!("Error accepting quic connection: {}", e);
+                        }
                     }
                 }
-            }
-        };
-        tokio::spawn(fut);
+            };
+            tokio::spawn(fut);
+        }
         Ok(())
     }
 }

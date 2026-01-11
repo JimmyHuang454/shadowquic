@@ -3,6 +3,7 @@ use bytes::Bytes;
 use std::{
     net::{ToSocketAddrs, UdpSocket},
     sync::Arc,
+    time::SystemTime,
 };
 use tokio::{
     io::AsyncReadExt,
@@ -54,13 +55,27 @@ impl<End: QuicClient> ShadowQuicClient<End> {
     }
 
     pub async fn get_conn(&self) -> Result<SQConn<End::C>, SError> {
-        let addr = self
+        let mut addr = self
             .config
             .addr
             .to_socket_addrs()
             .unwrap_or_else(|_| panic!("resolve quic addr faile: {}", self.config.addr))
             .next()
             .unwrap_or_else(|| panic!("resolve quic addr faile: {}", self.config.addr));
+
+        if let Some(ph) = &self.config.port_hopping {
+            let ports = ph.get_ports();
+            if !ports.is_empty() {
+                let nanos = SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .subsec_nanos();
+                let port = ports[nanos as usize % ports.len()];
+                addr.set_port(port);
+                info!("Port hopping selected port: {}", port);
+            }
+        }
+
         let conn = self
             .quic_end
             .get_or_init(|| async {
