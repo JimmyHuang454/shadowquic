@@ -227,7 +227,12 @@ pub fn gen_client_cfg(cfg: &ShadowQuicClientCfg) -> quinn::ClientConfig {
         .max_concurrent_uni_streams(500u32.into())
         .mtu_discovery_config(Some(mtudis))
         .min_mtu(cfg.min_mtu)
-        .initial_mtu(cfg.initial_mtu);
+        .initial_mtu(cfg.initial_mtu)
+        .max_idle_timeout(Some(
+            Duration::from_millis(cfg.idle_timeout as u64)
+                .try_into()
+                .unwrap(),
+        ));
 
     // Only increase receive window to maximize download speed
     tp_cfg.stream_receive_window(MAX_STREAM_WINDOW.try_into().unwrap());
@@ -299,7 +304,12 @@ impl QuicServer for Endpoint {
             .max_concurrent_uni_streams(1000u32.into())
             .mtu_discovery_config(Some(mtudis))
             .min_mtu(cfg.min_mtu)
-            .initial_mtu(cfg.initial_mtu);
+            .initial_mtu(cfg.initial_mtu)
+            .max_idle_timeout(Some(
+                Duration::from_millis(cfg.idle_timeout as u64)
+                    .try_into()
+                    .unwrap(),
+            ));
         match cfg.congestion_control {
             CongestionControl::Bbr => {
                 let bbr_config = BbrConfig::default();

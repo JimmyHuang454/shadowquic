@@ -189,6 +189,11 @@ pub struct ShadowQuicClientCfg {
     pub over_stream: bool,
     #[serde(default = "default_min_mtu")]
     pub min_mtu: u16,
+    /// Idle timeout in milliseconds
+    /// The connection will be closed if no packet is received within this time.
+    /// Default is 30_000 (30s).
+    #[serde(default = "default_idle_timeout")]
+    pub idle_timeout: u32,
     /// Keep alive interval in milliseconds
     /// 0 means disable keep alive, should be smaller than 30_000(idle time).
     /// Disabled by default.
@@ -218,6 +223,7 @@ impl Default for ShadowQuicClientCfg {
             zero_rtt: Default::default(),
             over_stream: Default::default(),
             min_mtu: default_min_mtu(),
+            idle_timeout: default_idle_timeout(),
             keep_alive_interval: default_keep_alive_interval(),
             port_hopping: None,
             #[cfg(target_os = "android")]
@@ -249,6 +255,9 @@ pub fn default_keep_alive_interval() -> u32 {
 }
 pub fn default_rate_limit() -> u64 {
     u64::MAX
+}
+pub fn default_idle_timeout() -> u32 {
+    30_000
 }
 
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
@@ -358,6 +367,11 @@ pub struct ShadowQuicServerCfg {
     /// 1400 is recommended for high packet loss network. default to be 1290
     #[serde(default = "default_min_mtu")]
     pub min_mtu: u16,
+    /// Idle timeout in milliseconds
+    /// The connection will be closed if no packet is received within this time.
+    /// Default is 30_000 (30s).
+    #[serde(default = "default_idle_timeout")]
+    pub idle_timeout: u32,
     /// Port hopping configuration
     /// Listen on multiple ports.
     /// Range format: "start-end" e.g. "1000-2000"
@@ -394,6 +408,7 @@ impl Default for ShadowQuicServerCfg {
             congestion_control: Default::default(),
             initial_mtu: default_initial_mtu(),
             min_mtu: default_min_mtu(),
+            idle_timeout: default_idle_timeout(),
             server_name: None,
             port_hopping: None,
         }
