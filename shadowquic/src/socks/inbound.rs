@@ -56,6 +56,9 @@ impl SocksServer {
             users: cfg.users,
         })
     }
+    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.listener.local_addr()
+    }
     pub async fn authenticate(&self, mut stream: TcpStream) -> Result<TcpStream, SError> {
         let auth_req = AuthReq::decode(&mut stream).await?;
         if auth_req.version != SOCKS5_VERSION {

@@ -11,7 +11,7 @@ use crate::{
 };
 use tokio::{
     io::{AsyncReadExt, copy_bidirectional_with_sizes},
-    net::{TcpStream, UdpSocket},
+    net::TcpStream,
     sync::OnceCell,
 };
 
@@ -30,6 +30,7 @@ pub struct SocksClient {
     pub addr: String,
     pub username: Option<String>,
     pub password: Option<String>,
+    pub bind_interface: Option<String>,
 }
 
 #[async_trait]
@@ -61,6 +62,7 @@ impl SocksClient {
             addr: cfg.addr,
             username: cfg.username,
             password: cfg.password,
+            bind_interface: cfg.bind_interface,
         }
     }
     async fn authenticate(&self, mut tcp: TcpStream) -> Result<TcpStream, SError> {
@@ -115,7 +117,12 @@ impl SocksClient {
 
     async fn handle_tcp(&self, mut tcp_session: TcpSession) -> Result<(), SError> {
         tracing::info!("connect to socks server: {}", self.addr);
-        let tcp = TcpStream::connect(self.addr.clone()).await?;
+        let addr = tokio::net::lookup_host(&self.addr)
+            .await?
+            .next()
+            .ok_or(SError::SocksError("resolve failed".into()))?;
+        let tcp =
+            crate::utils::socket::connect_tcp(addr, self.bind_interface.as_deref(), None).await?;
         tcp.set_nodelay(true)?;
         let mut tcp = self.authenticate(tcp).await?;
         let socksreq = CmdReq {
@@ -134,7 +141,12 @@ impl SocksClient {
 
     async fn handle_udp(&self, mut udp_session: UdpSession) -> Result<(), SError> {
         tracing::info!("connect to socks server: {}", self.addr);
-        let tcp = TcpStream::connect(self.addr.clone()).await?;
+        let addr = tokio::net::lookup_host(&self.addr)
+            .await?
+            .next()
+            .ok_or(SError::SocksError("resolve failed".into()))?;
+        let tcp =
+            crate::utils::socket::connect_tcp(addr, self.bind_interface.as_deref(), None).await?;
         tcp.set_nodelay(true)?;
 
         let mut tcp = self.authenticate(tcp).await?;
@@ -154,13 +166,14 @@ impl SocksClient {
             .expect("socks server return a unresolvable address")
             .next()
             .expect("socks server return a unresolvable address");
-        let bind_addr = if peer_addr.is_ipv4() {
-            "0.0.0.0:0"
+        let bind_addr: std::net::SocketAddr = if peer_addr.is_ipv4() {
+            "0.0.0.0:0".parse().unwrap()
         } else {
-            "[::]:0"
+            "[::]:0".parse().unwrap()
         };
 
-        let socket = UdpSocket::bind(bind_addr).await?;
+        let socket =
+            crate::utils::socket::bind_udp(bind_addr, self.bind_interface.as_deref()).await?;
         socket.connect(peer_addr).await?;
         let mut upstream = UdpSocksWrap(Arc::new(socket), OnceCell::new_with(Some(peer_addr)));
 

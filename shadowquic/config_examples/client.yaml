@@ -1,18 +1,32 @@
-inbound:
+inbounds:
+  - tag: socks-in
     type: socks
     bind-addr: "127.0.0.1:1089"
-outbound:
-    type: shadowquic
-    addr: "127.0.0.1:1443"
-    username: "87654321"
-    password: "12345678"
-    server-name: "cloudflare.com" # must be the same as jls_upstream in server
-    alpn: ["h3"]
-    initial-mtu: 1300
-    congestion-control: bbr
-    zero-rtt: true
-    over-stream: false  # true for udp over stream, false for udp over datagram
+outbounds:
+    shadowquic-out:
+        type: shadowquic
+        addr: "127.0.0.1:1443"
+        username: "87654321"
+        password: "12345678"
+        server-name: "cloudflare.com" # must be the same as jls_upstream in server
+        alpn: ["h3"]
+        initial-mtu: 1300
+        congestion-control: bbr
+        zero-rtt: true
+        over-stream: false  # true for udp over stream, false for udp over datagram
+    direct-out:
+        type: direct
+rules:
+    - domain:
+        - google.com
+        - youtube.com
+      outbound: shadowquic-out
+    - ip:
+        - 1.1.1.1/32
+        - 8.8.8.8/32
+      outbound: direct-out
+    - inbound:
+        - socks-in
+      outbound: shadowquic-out
+final: "shadowquic-out"
 log-level: "trace"
-
-
-

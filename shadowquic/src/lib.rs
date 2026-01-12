@@ -14,10 +14,13 @@ use tracing::error;
 pub mod config;
 pub mod direct;
 pub mod error;
+pub mod http;
 pub mod msgs;
 pub mod quic;
+pub mod router;
 pub mod shadowquic;
 pub mod socks;
+pub mod tun;
 pub mod utils;
 pub enum ProxyRequest<T = AnyTcp, I = AnyUdpRecv, O = AnyUdpSend> {
     Tcp(TcpSession<T>),
@@ -34,16 +37,16 @@ pub trait UdpRecv: Send + Sync + Unpin {
     async fn recv_from(&mut self) -> Result<(Bytes, SocksAddr), SError>; // socksaddr is proxy addr
 }
 pub struct TcpSession<IO = AnyTcp> {
-    stream: IO,
-    dst: SocksAddr,
+    pub stream: IO,
+    pub dst: SocksAddr,
 }
 
 pub struct UdpSession<I = AnyUdpRecv, O = AnyUdpSend> {
-    recv: I,
-    send: O,
+    pub recv: I,
+    pub send: O,
     /// Control stream, should be kept alive during session.
-    stream: Option<AnyTcp>,
-    dst: SocksAddr,
+    pub stream: Option<AnyTcp>,
+    pub dst: SocksAddr,
 }
 
 pub type AnyTcp = Box<dyn TcpTrait>;
@@ -82,29 +85,52 @@ impl UdpRecv for Receiver<(Bytes, SocksAddr)> {
         Ok(r)
     }
 }
+use crate::router::Router;
+
 pub struct Manager {
-    pub inbound: Box<dyn Inbound>,
-    pub outbound: Box<dyn Outbound>,
+    pub inbounds: Vec<(String, Box<dyn Inbound>)>,
+    pub router: Arc<Router>,
 }
 
 impl Manager {
     pub async fn run(self) -> Result<(), SError> {
-        self.inbound.init().await?;
-        let mut inbound = self.inbound;
-        let mut outbound = self.outbound;
-        loop {
-            match inbound.accept().await {
-                Ok(req) => match outbound.handle(req).await {
-                    Ok(_) => {}
-                    Err(e) => {
-                        error!("error during handling request: {}", e)
-                    }
-                },
-                Err(e) => {
-                    error!("error during accepting request: {}", e)
+        let mut tasks = Vec::new();
+        for (tag, inbound) in self.inbounds {
+            let router = self.router.clone();
+            tasks.push(tokio::spawn(async move {
+                if let Err(e) = inbound.init().await {
+                    error!("error during init inbound {}: {}", tag, e);
+                    return;
                 }
-            }
+                let mut inbound = inbound;
+                loop {
+                    match inbound.accept().await {
+                        Ok(req) => {
+                            let dst = match &req {
+                                ProxyRequest::Tcp(s) => &s.dst,
+                                ProxyRequest::Udp(s) => &s.dst,
+                            };
+                            let outbound = router.route(&tag, dst);
+                            let mut out = outbound.lock().await;
+                            match out.handle(req).await {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    error!("error during handling request: {}", e)
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("error during accepting request: {}", e)
+                        }
+                    }
+                }
+            }));
         }
+
+        for task in tasks {
+            let _ = task.await;
+        }
+
         #[allow(unreachable_code)]
         Ok(())
     }

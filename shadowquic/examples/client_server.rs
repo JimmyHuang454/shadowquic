@@ -1,4 +1,7 @@
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::{time::Duration, vec};
+use tokio::sync::Mutex;
 
 use shadowquic::{
     Manager,
@@ -7,6 +10,7 @@ use shadowquic::{
         SocksServerCfg, default_initial_mtu,
     },
     direct::outbound::DirectOut,
+    router::Router,
     shadowquic::{inbound::ShadowQuicServer, outbound::ShadowQuicClient},
     socks::inbound::SocksServer,
 };
@@ -55,9 +59,18 @@ async fn test_shadowquic() {
         ..Default::default()
     });
 
+    let mut client_outbounds = HashMap::new();
+    client_outbounds.insert(
+        "sq".to_string(),
+        Arc::new(Mutex::new(
+            Box::new(sq_client) as Box<dyn shadowquic::Outbound>
+        )),
+    );
+    let client_router = Router::new(vec![], client_outbounds, Some("sq".to_string())).unwrap();
+
     let client = Manager {
-        inbound: Box::new(socks_server),
-        outbound: Box::new(sq_client),
+        inbounds: vec![("socks".to_string(), Box::new(socks_server))],
+        router: Arc::new(client_router),
     };
 
     let sq_server = ShadowQuicServer::new(ShadowQuicServerCfg {
@@ -78,9 +91,19 @@ async fn test_shadowquic() {
     })
     .unwrap();
     let direct_client = DirectOut::default();
+
+    let mut server_outbounds = HashMap::new();
+    server_outbounds.insert(
+        "direct".to_string(),
+        Arc::new(Mutex::new(
+            Box::new(direct_client) as Box<dyn shadowquic::Outbound>
+        )),
+    );
+    let server_router = Router::new(vec![], server_outbounds, Some("direct".to_string())).unwrap();
+
     let server = Manager {
-        inbound: Box::new(sq_server),
-        outbound: Box::new(direct_client),
+        inbounds: vec![("sq".to_string(), Box::new(sq_server))],
+        router: Arc::new(server_router),
     };
 
     tokio::spawn(server.run());

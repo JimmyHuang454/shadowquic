@@ -3,7 +3,7 @@ use std::{io::IsTerminal, path::PathBuf};
 use clap::Parser;
 use shadowquic::config::{Config, LogLevel};
 use tracing::{Level, info};
-use tracing_subscriber::{fmt::time::LocalTime, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser)]
 #[clap(author, about, long_about = None, version)]
@@ -32,7 +32,14 @@ async fn main() {
         .expect("creating inbound/outbound failed");
 
     info!("shadowquic {} running", env!("CARGO_PKG_VERSION"));
-    manager.run().await.expect("shadowquic stopped");
+    tokio::select! {
+        res = manager.run() => {
+            res.expect("shadowquic stopped");
+        }
+        _ = tokio::signal::ctrl_c() => {
+            info!("received ctrl-c, shutting down");
+        }
+    }
 }
 
 fn setup_log(level: LogLevel) {
@@ -51,17 +58,13 @@ fn setup_log(level: LogLevel) {
     #[cfg(feature = "tokio-console")]
     let console_layer = console_subscriber::spawn();
 
-    let timer = LocalTime::new(time::macros::format_description!(
-        "[year repr:last_two]-[month]-[day] [hour]:[minute]:[second].[subsecond digits:3]"
-    ));
-
     let fmt = tracing_subscriber::fmt::Layer::new()
-        .with_timer(timer)
+        .without_time()
         .with_ansi(std::io::stdout().is_terminal())
         //.compact()
         .with_target(cfg!(debug_assertions))
-        .with_file(false)
-        .with_line_number(false)
+        .with_file(true)
+        .with_line_number(true)
         .with_level(true)
         .with_writer(std::io::stdout);
     let sub = tracing_subscriber::registry().with(fmt).with(filter);

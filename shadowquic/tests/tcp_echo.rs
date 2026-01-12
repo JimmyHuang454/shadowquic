@@ -7,6 +7,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use tokio::{net::TcpListener, time::Duration};
 
+use shadowquic::router::Router;
+use std::collections::HashMap;
+
 use shadowquic::{
     Manager,
     direct::outbound::DirectOut,
@@ -17,6 +20,9 @@ use shadowquic::{
 use tracing::info;
 use tracing::{Level, level_filters::LevelFilter, trace};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 const CHUNK_LEN: usize = 1024;
 const ROUND: usize = 100;
@@ -112,9 +118,18 @@ async fn test_shadowquic() {
         ..Default::default()
     });
 
+    let mut client_outbounds = HashMap::new();
+    client_outbounds.insert(
+        "sq".to_string(),
+        Arc::new(Mutex::new(
+            Box::new(sq_client) as Box<dyn shadowquic::Outbound>
+        )),
+    );
+    let client_router = Router::new(vec![], client_outbounds, Some("sq".to_string())).unwrap();
+
     let client = Manager {
-        inbound: Box::new(socks_server),
-        outbound: Box::new(sq_client),
+        inbounds: vec![("socks".to_string(), Box::new(socks_server))],
+        router: Arc::new(client_router),
     };
 
     let sq_server = ShadowQuicServer::new(ShadowQuicServerCfg {
@@ -135,9 +150,19 @@ async fn test_shadowquic() {
     })
     .unwrap();
     let direct_client = DirectOut::default();
+
+    let mut server_outbounds = HashMap::new();
+    server_outbounds.insert(
+        "direct".to_string(),
+        Arc::new(Mutex::new(
+            Box::new(direct_client) as Box<dyn shadowquic::Outbound>
+        )),
+    );
+    let server_router = Router::new(vec![], server_outbounds, Some("direct".to_string())).unwrap();
+
     let server = Manager {
-        inbound: Box::new(sq_server),
-        outbound: Box::new(direct_client),
+        inbounds: vec![("sq".to_string(), Box::new(sq_server))],
+        router: Arc::new(server_router),
     };
 
     tokio::spawn(server.run());
