@@ -9,7 +9,7 @@ use tokio::net::TcpStream;
 use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::mpsc::{Receiver, Sender};
-use tracing::error;
+use tracing::{error, trace};
 
 pub mod config;
 pub mod direct;
@@ -36,18 +36,27 @@ pub trait UdpSend: Send + Sync + Unpin {
 pub trait UdpRecv: Send + Sync + Unpin {
     async fn recv_from(&mut self) -> Result<(Bytes, SocksAddr), SError>; // socksaddr is proxy addr
 }
-pub struct TcpSession<IO = AnyTcp> {
-    pub stream: IO,
+use std::time::Instant;
+
+pub struct Session<T> {
     pub dst: SocksAddr,
+    pub inner: T,
+    pub start_time: Instant,
 }
 
-pub struct UdpSession<I = AnyUdpRecv, O = AnyUdpSend> {
+pub struct TcpInner<IO = AnyTcp> {
+    pub stream: IO,
+}
+
+pub struct UdpInner<I = AnyUdpRecv, O = AnyUdpSend> {
     pub recv: I,
     pub send: O,
     /// Control stream, should be kept alive during session.
     pub stream: Option<AnyTcp>,
-    pub dst: SocksAddr,
 }
+
+pub type TcpSession<IO = AnyTcp> = Session<TcpInner<IO>>;
+pub type UdpSession<I = AnyUdpRecv, O = AnyUdpSend> = Session<UdpInner<I, O>>;
 
 pub type AnyTcp = Box<dyn TcpTrait>;
 pub type AnyUdpSend = Arc<dyn UdpSend>;
@@ -65,7 +74,10 @@ pub trait Inbound<T = AnyTcp, I = AnyUdpRecv, O = AnyUdpSend>: Send + Sync + Unp
 
 #[async_trait]
 pub trait Outbound<T = AnyTcp, I = AnyUdpRecv, O = AnyUdpSend>: Send + Sync + Unpin {
-    async fn handle(&mut self, req: ProxyRequest<T, I, O>) -> Result<(), SError>;
+    async fn handle(
+        &mut self,
+        req: ProxyRequest<T, I, O>,
+    ) -> Result<tokio::sync::oneshot::Receiver<(u64, u64)>, SError>;
 }
 
 #[async_trait]
@@ -95,25 +107,37 @@ pub struct Manager {
 impl Manager {
     pub async fn run(self) -> Result<(), SError> {
         let mut tasks = Vec::new();
-        for (tag, inbound) in self.inbounds {
+        for (tag, i) in self.inbounds {
             let router = self.router.clone();
             tasks.push(tokio::spawn(async move {
-                if let Err(e) = inbound.init().await {
+                if let Err(e) = i.init().await {
                     error!("error during init inbound {}: {}", tag, e);
                     return;
                 }
-                let mut inbound = inbound;
+                let mut inbound = i;
                 loop {
                     match inbound.accept().await {
                         Ok(req) => {
-                            let dst = match &req {
-                                ProxyRequest::Tcp(s) => &s.dst,
-                                ProxyRequest::Udp(s) => &s.dst,
-                            };
-                            let outbound = router.route(&tag, dst);
+                            let outbound = router.route(&tag, &req);
                             let mut out = outbound.lock().await;
+                            let (dst, start_time) = match &req {
+                                ProxyRequest::Tcp(s) => (s.dst.clone(), s.start_time),
+                                ProxyRequest::Udp(s) => (s.dst.clone(), s.start_time),
+                            };
                             match out.handle(req).await {
-                                Ok(_) => {}
+                                Ok(rx) => {
+                                    tokio::spawn(async move {
+                                        if let Ok((upload, download)) = rx.await {
+                                            trace!(
+                                                "request to {} finished, upload: {}, download: {}, cost: {:?}",
+                                                dst,
+                                                upload,
+                                                download,
+                                                start_time.elapsed()
+                                            );
+                                        }
+                                    });
+                                }
                                 Err(e) => {
                                     error!("error during handling request: {}", e)
                                 }

@@ -35,24 +35,35 @@ pub struct SocksClient {
 
 #[async_trait]
 impl Outbound for SocksClient {
-    async fn handle(&mut self, req: ProxyRequest) -> Result<(), SError> {
+    async fn handle(&mut self, req: ProxyRequest) -> Result<tokio::sync::oneshot::Receiver<(u64, u64)>, SError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
         let span = trace_span!("socks", server = self.addr);
         let client = self.clone();
         let fut = async move {
-            match req {
+            let res = match req {
                 ProxyRequest::Tcp(tcp_session) => client.handle_tcp(tcp_session).await,
                 ProxyRequest::Udp(udp_session) => client.handle_udp(udp_session).await,
+            };
+            match res {
+                Ok(stats) => {
+                    let _ = tx.send(stats);
+                    Ok(())
+                }
+                Err(e) => {
+                    let _ = tx.send((0, 0));
+                    Err(e)
+                }
             }
         };
 
         tokio::spawn(
             async {
                 fut.await
-                    .map_err(|x| error!("error due to handle socks request:{}", x))
+                    .map_err(|x: SError| error!("error due to handle socks request:{}", x))
             }
             .instrument(span),
         );
-        Ok(())
+        Ok(rx)
     }
 }
 
@@ -115,7 +126,7 @@ impl SocksClient {
         Ok(tcp)
     }
 
-    async fn handle_tcp(&self, mut tcp_session: TcpSession) -> Result<(), SError> {
+    async fn handle_tcp(&self, mut tcp_session: TcpSession) -> Result<(u64, u64), SError> {
         tracing::info!("connect to socks server: {}", self.addr);
         let addr = tokio::net::lookup_host(&self.addr)
             .await?
@@ -134,12 +145,17 @@ impl SocksClient {
         socksreq.encode(&mut tcp).await?;
         let _rep = CmdReply::decode(&mut tcp).await?;
         tracing::trace!("socks tcp connection established");
-        copy_bidirectional_with_sizes(&mut tcp, &mut tcp_session.stream, 16 * 1024, 16 * 1024)
-            .await?;
-        Ok(())
+        let (upload, download) = copy_bidirectional_with_sizes(
+            &mut tcp,
+            &mut tcp_session.inner.stream,
+            16 * 1024,
+            16 * 1024,
+        )
+        .await?;
+        Ok((upload, download))
     }
 
-    async fn handle_udp(&self, mut udp_session: UdpSession) -> Result<(), SError> {
+    async fn handle_udp(&self, mut udp_session: UdpSession) -> Result<(u64, u64), SError> {
         tracing::info!("connect to socks server: {}", self.addr);
         let addr = tokio::net::lookup_host(&self.addr)
             .await?
@@ -182,14 +198,14 @@ impl SocksClient {
             loop {
                 let (buf, dst) = upstream.recv_from().await?;
 
-                let _ = udp_session.send.send_to(buf, dst).await?;
+                let _ = udp_session.inner.send.send_to(buf, dst).await?;
             }
             #[allow(unreachable_code)]
             (Ok(()) as Result<(), SError>)
         };
         let fut2 = async move {
             loop {
-                let (buf, dst) = udp_session.recv.recv_from().await?;
+                let (buf, dst) = udp_session.inner.recv.recv_from().await?;
 
                 let _ = upstream_clone.send_to(buf, dst).await?;
             }
@@ -199,11 +215,12 @@ impl SocksClient {
         // control stream, in socks5 inbound, end of control stream
         // means end of udp association.
         let fut3 = async {
-            if udp_session.stream.is_none() {
+            if udp_session.inner.stream.is_none() {
                 return Ok(());
             }
             let mut buf = [0u8];
             udp_session
+                .inner
                 .stream
                 .unwrap()
                 .read_exact(&mut buf)
@@ -218,6 +235,6 @@ impl SocksClient {
         // Flatten spawn handle using try_join! doesn't work. Don't know why
         tokio::try_join!(fut1, fut2, fut3)?;
 
-        Ok(())
+        Ok((0, 0))
     }
 }

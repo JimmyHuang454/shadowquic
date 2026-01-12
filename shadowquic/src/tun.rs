@@ -11,7 +11,7 @@ use tracing::{error, info, warn};
 use tun_rs::DeviceBuilder;
 
 use crate::{
-    AnyUdpRecv, AnyUdpSend, Inbound, ProxyRequest, UdpSend, UdpSession,
+    AnyUdpRecv, AnyUdpSend, Inbound, ProxyRequest, UdpInner, UdpSend, UdpSession,
     config::TunInboundCfg,
     error::SError,
     msgs::socks5::{AddrOrDomain, SocksAddr},
@@ -228,10 +228,13 @@ impl Inbound for TunInbound {
                             };
 
                             let session = UdpSession {
-                                recv: Box::new(down_rx) as AnyUdpRecv,
-                                send: std::sync::Arc::new(send) as AnyUdpSend,
-                                stream: None,
+                                inner: UdpInner {
+                                    recv: Box::new(down_rx) as AnyUdpRecv,
+                                    send: std::sync::Arc::new(send) as AnyUdpSend,
+                                    stream: None,
+                                },
                                 dst: bind_dst,
+                                start_time: now,
                             };
 
                             if let Err(e) = req_tx.send(ProxyRequest::Udp(session)).await {

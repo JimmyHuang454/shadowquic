@@ -11,7 +11,7 @@ use tokio::{
 use tracing::{Instrument, Level, error, event, info, trace, trace_span};
 
 use crate::{
-    Inbound, ProxyRequest, TcpSession, TcpTrait, UdpSession,
+    Inbound, ProxyRequest, TcpInner, TcpSession, TcpTrait, UdpInner, UdpSession,
     config::ShadowQuicServerCfg,
     error::SError,
     msgs::{
@@ -145,10 +145,11 @@ impl<C: QuicConnection> SQServerConn<C> {
         while conn.close_reason().is_none() {
             select! {
                 bi = conn.accept_bi() => {
+                    let start_time = std::time::Instant::now();
                     let (send, recv, id) = bi?;
                     let span = trace_span!("bistream", id = id);
                     trace!("bistream accepted");
-                    tokio::spawn(self.clone().handle_bistream(send, recv, req_send.clone()).instrument(span).in_current_span());
+                    tokio::spawn(self.clone().handle_bistream(send, recv, req_send.clone(), start_time).instrument(span).in_current_span());
                 },
             }
         }
@@ -159,6 +160,7 @@ impl<C: QuicConnection> SQServerConn<C> {
         send: C::SendStream,
         mut recv: C::RecvStream,
         req_send: Sender<ProxyRequest>,
+        start_time: std::time::Instant,
     ) -> Result<(), SError> {
         let req = SQReq::decode(&mut recv).await?;
 
@@ -178,8 +180,11 @@ impl<C: QuicConnection> SQServerConn<C> {
                     req.dst.clone()
                 );
                 let tcp: TcpSession = TcpSession {
-                    stream: Box::new(Unsplit { s: send, r: recv }),
+                    inner: TcpInner {
+                        stream: Box::new(Unsplit { s: send, r: recv }),
+                    },
                     dst: req.dst,
+                    start_time,
                 };
                 req_send
                     .send(ProxyRequest::Tcp(tcp))
@@ -191,10 +196,13 @@ impl<C: QuicConnection> SQServerConn<C> {
                 let (local_send, udp_recv) = channel::<(Bytes, SocksAddr)>(10);
                 let (udp_send, local_recv) = channel::<(Bytes, SocksAddr)>(10);
                 let udp: UdpSession = UdpSession {
-                    send: Arc::new(udp_send),
-                    recv: Box::new(udp_recv),
-                    stream: None,
+                    inner: UdpInner {
+                        send: Arc::new(udp_send),
+                        recv: Box::new(udp_recv),
+                        stream: None,
+                    },
                     dst: req.dst,
+                    start_time,
                 };
                 let local_send = Arc::new(local_send);
                 req_send

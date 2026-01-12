@@ -40,5 +40,8 @@ rules:
     - inbound:
         - http-in
       outbound: sq-out
+    - inbound:
+        - sq-in
+      outbound: direct-out
 final: direct-out
 log-level: "trace"

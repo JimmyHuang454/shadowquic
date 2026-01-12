@@ -1,7 +1,7 @@
 use crate::config::{AuthUser, HttpServerCfg};
 use crate::error::SError;
 use crate::msgs::socks5::SocksAddr;
-use crate::{Inbound, ProxyRequest, TcpSession};
+use crate::{Inbound, ProxyRequest, TcpInner, TcpSession};
 use anyhow::Result;
 use async_trait::async_trait;
 use bytes::{Buf, Bytes, BytesMut};
@@ -106,6 +106,7 @@ impl Inbound for HttpServer {
             .accept()
             .await
             .map_err(|e| SError::SocksError(e.to_string()))?;
+        let start_time = std::time::Instant::now();
 
         let mut buf = BytesMut::with_capacity(4096);
 
@@ -167,8 +168,9 @@ impl Inbound for HttpServer {
                     let prefixed_stream = PrefixedTcpStream { stream, prefix };
 
                     return Ok(ProxyRequest::Tcp(TcpSession {
-                        stream: Box::new(prefixed_stream),
+                        inner: TcpInner { stream: Box::new(prefixed_stream) },
                         dst,
+                        start_time,
                     }));
                 }
                 Ok(None) => {

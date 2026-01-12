@@ -10,7 +10,7 @@ use crate::msgs::socks5::{
     SOCKS5_CMD_UDP_ASSOCIATE, SOCKS5_REPLY_SUCCEEDED, SOCKS5_VERSION,
 };
 use crate::utils::dual_socket::to_ipv4_mapped;
-use crate::{Inbound, ProxyRequest, TcpSession, UdpSession};
+use crate::{Inbound, ProxyRequest, TcpInner, TcpSession, UdpInner, UdpSession};
 use async_trait::async_trait;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -160,6 +160,7 @@ impl SocksServer {
 impl Inbound for SocksServer {
     async fn accept(&mut self) -> Result<ProxyRequest, SError> {
         let (stream, addr) = self.listener.accept().await?;
+        let start_time = std::time::Instant::now();
         let span = trace_span!("socks", src = addr.to_string());
         // ipv4 may be mapped for dual stack socket
         let local_addr = to_ipv4_mapped(stream.local_addr().unwrap());
@@ -170,16 +171,20 @@ impl Inbound for SocksServer {
             .await?;
         match req.cmd {
             SOCKS5_CMD_TCP_CONNECT => Ok(ProxyRequest::Tcp(TcpSession {
-                stream: Box::new(s),
+                inner: TcpInner { stream: Box::new(s) },
                 dst: req.dst,
+                start_time,
             })),
             SOCKS5_CMD_UDP_ASSOCIATE => {
                 let socket = Arc::new(socket.unwrap());
                 Ok(ProxyRequest::Udp(UdpSession {
-                    send: Arc::new(UdpSocksWrap(socket.clone(), Default::default())),
-                    recv: Box::new(UdpSocksWrap(socket, Default::default())),
+                    inner: UdpInner {
+                        send: Arc::new(UdpSocksWrap(socket.clone(), Default::default())),
+                        recv: Box::new(UdpSocksWrap(socket, Default::default())),
+                        stream: Some(Box::new(s)),
+                    },
                     dst: req.dst,
-                    stream: Some(Box::new(s)),
+                    start_time,
                 }))
             }
             _ => {

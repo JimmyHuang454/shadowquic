@@ -30,41 +30,58 @@ impl Outbound for DirectOut {
     async fn handle(
         &mut self,
         req: crate::ProxyRequest,
-    ) -> anyhow::Result<(), crate::error::SError> {
+    ) -> Result<tokio::sync::oneshot::Receiver<(u64, u64)>, crate::error::SError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
         let dns_strategy = self.cfg.dns_strategy.clone();
         let self_clone = self.clone();
         let fut = async move {
-            match req {
-                crate::ProxyRequest::Tcp(mut tcp_session) => {
-                    trace!("direct tcp to {}", tcp_session.dst);
-                    let dst = tcp_session.dst.to_socket_addrs()?;
-                    let dst = apply_dns_strategy(dst, &dns_strategy)
-                        .ok_or(SError::DomainResolveFailed(tcp_session.dst.to_string()))?;
-                    trace!("resolved to {}", dst);
-                    let mut upstream = TcpStream::connect(dst).await?;
-                    let (_, _) = tokio::io::copy_bidirectional_with_sizes(
-                        &mut tcp_session.stream,
-                        &mut upstream,
-                        1024 * 16,
-                        1024 * 16,
-                    )
-                    .await?;
-                }
-                crate::ProxyRequest::Udp(udp_session) => {
-                    self_clone.handle_udp(udp_session).await?;
+            let res = async {
+                match req {
+                    crate::ProxyRequest::Tcp(mut tcp_session) => {
+                        trace!("direct tcp to {}", tcp_session.dst);
+                        let dst = tcp_session.dst.to_socket_addrs()?;
+                        let dst = apply_dns_strategy(dst, &dns_strategy)
+                            .ok_or(SError::DomainResolveFailed(tcp_session.dst.to_string()))?;
+                        trace!("resolved to {}", dst);
+                        let mut upstream = TcpStream::connect(dst).await?;
+                        let (upload, download) = tokio::io::copy_bidirectional_with_sizes(
+                            &mut tcp_session.inner.stream,
+                            &mut upstream,
+                            1024 * 16,
+                            1024 * 16,
+                        )
+                        .await?;
+                        Ok((upload, download))
+                    }
+                    crate::ProxyRequest::Udp(udp_session) => {
+                        self_clone.handle_udp(udp_session).await?;
+                        Ok((0, 0))
+                    }
                 }
             }
-            Ok(()) as Result<(), SError>
+            .await;
+
+            match res {
+                Ok(stats) => {
+                    let _ = tx.send(stats);
+                    Ok(())
+                }
+                Err(e) => {
+                    let _ = tx.send((0, 0)); // Send 0s on error? Or drop tx?
+                                             // If we drop tx, rx.await fails.
+                    Err(e)
+                }
+            }
         };
         let span = trace_span!("direct");
         tokio::spawn(
             async {
-                let _ = fut.await.map_err(|x| error!("{}", x));
+                let _ = fut.await.map_err(|x: SError| error!("{}", x));
             }
             .instrument(span),
         );
 
-        Ok(())
+        Ok(rx)
     }
 }
 
@@ -146,7 +163,7 @@ impl DirectOut {
 
         let upstream = Arc::new(socket);
         let upstream_clone = upstream.clone();
-        let mut downstream = udp_session.recv;
+        let mut downstream = udp_session.inner.recv;
 
         let dns_cache = DnsResolve::default();
         let dns_cache_clone = dns_cache.clone();
@@ -162,7 +179,7 @@ impl DirectOut {
                 //trace!("udp source inverse resolved to:{}", dst);
                 let buf = buf_send.freeze();
                 //trace!("udp recved:{} bytes", len);
-                let _ = udp_session.send.send_to(buf.slice(..len), dst).await?;
+                let _ = udp_session.inner.send.send_to(buf.slice(..len), dst).await?;
             }
             #[allow(unreachable_code)]
             (Ok(()) as Result<(), SError>)

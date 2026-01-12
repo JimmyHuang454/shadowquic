@@ -94,7 +94,11 @@ impl Router {
         })
     }
 
-    pub fn route(&self, inbound_tag: &str, dst: &SocksAddr) -> Arc<Mutex<Box<dyn Outbound>>> {
+    pub fn route(&self, inbound_tag: &str, req: &crate::ProxyRequest) -> Arc<Mutex<Box<dyn Outbound>>> {
+        let dst = match req {
+            crate::ProxyRequest::Tcp(s) => &s.dst,
+            crate::ProxyRequest::Udp(s) => &s.dst,
+        };
         for rule in &self.rules {
             if let Some(inbounds) = &rule.inbound {
                 if !inbounds.iter().any(|t| t == inbound_tag) {
