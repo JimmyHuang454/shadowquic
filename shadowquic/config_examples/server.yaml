@@ -1,4 +1,5 @@
-inbound:
+inbounds:
+  - tag: sq-in
     type: shadowquic
     bind-addr: "0.0.0.0:1443"
     users:
@@ -11,10 +12,13 @@ inbound:
     alpn: ["h3"]
     congestion-control: bbr
     zero-rtt: true
-outbound:
-    type: direct
-    dns-strategy: prefer-ipv4 # or prefer-ipv6, ipv4-only, ipv6-only
+outbounds:
+    direct-out:
+        type: direct
+        dns-strategy: prefer-ipv4 # or prefer-ipv6, ipv4-only, ipv6-only
+rules:
+    - inbound:
+        - sq-in
+      outbound: direct-out
+final: "direct-out"
 log-level: "trace"
-
-
-

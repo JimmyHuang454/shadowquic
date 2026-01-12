@@ -1,15 +1,15 @@
-inbound:
+inbounds:
+  - tag: socks-in
     type: socks
     bind-addr: "[::]:1089"
     # users:
     #     - username: "username"
     #       password: "password"
-outbound:
-    type: socks
-    addr: "192.168.7.1:1089"
-    # username: "username"
-    # password: "password"
+outbounds:
+    socks-out:
+        type: socks
+        addr: "192.168.7.1:1089"
+        # username: "username"
+        # password: "password"
+final: socks-out
 log-level: "trace"
-
-
-

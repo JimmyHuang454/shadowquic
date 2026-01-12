@@ -1,4 +1,6 @@
+use shadowquic::router::Router;
 use std::{
+    collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     time::Duration,
 };
@@ -123,10 +125,12 @@ async fn test_shadowquic_overdatagram() -> Result<()> {
 }
 
 async fn spawn_socks_client(socks_port: u16) -> Result<()> {
+    let echo_port = socks_port + 4000;
+    spawn_udp_echo(echo_port).await;
     let opt: Opt = Opt {
         socks_server: SocketAddr::new("127.0.0.1".parse().unwrap(), socks_port),
-        target_server: String::from("dns.google.com"),
-        target_port: None,
+        target_server: String::from("127.0.0.1"),
+        target_port: Some(echo_port),
         query_domain: String::from("www.gstatic.com"),
         username: None,
         password: None,
@@ -167,6 +171,9 @@ async fn spawn_socks_client(socks_port: u16) -> Result<()> {
     Ok(())
 }
 
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
 async fn spawn_socks_server() {
     // env_logger::init();
     trace!("Running");
@@ -178,9 +185,19 @@ async fn spawn_socks_server() {
     .await
     .unwrap();
     let direct_client = DirectOut::new(DirectOutCfg::default());
+
+    let mut server_outbounds = HashMap::new();
+    server_outbounds.insert(
+        "direct".to_string(),
+        Arc::new(Mutex::new(
+            Box::new(direct_client) as Box<dyn shadowquic::Outbound>
+        )),
+    );
+    let server_router = Router::new(vec![], server_outbounds, Some("direct".to_string())).unwrap();
+
     let server = Manager {
-        inbound: Box::new(socks_server),
-        outbound: Box::new(direct_client),
+        inbounds: vec![("socks".to_string(), Box::new(socks_server))],
+        router: Arc::new(server_router),
     };
     tokio::spawn(server.run());
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -223,25 +240,26 @@ async fn dns_request<S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 async fn shadowquic_client_server(over_stream: bool, port: u16) {
-    // let filter = tracing_subscriber::filter::Targets::new()
-    //     // Enable the `INFO` level for anything in `my_crate`
-    //     .with_target("shadowquic", Level::TRACE)
-    //     .with_target("shadowquic::msgs::socks", LevelFilter::OFF);
+    let filter = tracing_subscriber::filter::Targets::new()
+        // Enable the `INFO` level for anything in `my_crate`
+        .with_target("shadowquic", Level::TRACE)
+        .with_target("dns_udp", Level::TRACE)
+        .with_target("shadowquic::msgs::socks", LevelFilter::OFF);
 
     // Enable the `DEBUG` level for a specific module.
 
     // Build a new subscriber with the `fmt` layer using the `Targets`
     // filter we constructed above.
-    // let _ = tracing_subscriber::registry()
-    //     .with(tracing_subscriber::fmt::layer())
-    //     .with(filter)
-    //     .try_init();
+    let _ = tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer())
+        .with(filter)
+        .try_init();
 
     // env_logger::init();
     trace!("Running");
 
     let socks_server = SocksServer::new(SocksServerCfg {
-        bind_addr: SocketAddr::new("127.0.0.1".parse().unwrap(), port),
+        bind_addr: format!("127.0.0.1:{}", port).parse().unwrap(),
         users: vec![],
     })
     .await
@@ -249,7 +267,7 @@ async fn shadowquic_client_server(over_stream: bool, port: u16) {
     let sq_client = ShadowQuicClient::new(ShadowQuicClientCfg {
         password: "123".into(),
         username: "123".into(),
-        addr: format!("127.0.0.1:{}", port + 10),
+        addr: format!("127.0.0.1:{}", port + 10).parse().unwrap(),
         server_name: "localhost".into(),
         alpn: vec!["h3".into()],
         initial_mtu: 1200,
@@ -259,9 +277,18 @@ async fn shadowquic_client_server(over_stream: bool, port: u16) {
         ..Default::default()
     });
 
+    let mut client_outbounds = HashMap::new();
+    client_outbounds.insert(
+        "sq".to_string(),
+        Arc::new(Mutex::new(
+            Box::new(sq_client) as Box<dyn shadowquic::Outbound>
+        )),
+    );
+    let client_router = Router::new(vec![], client_outbounds, Some("sq".to_string())).unwrap();
+
     let client = Manager {
-        inbound: Box::new(socks_server),
-        outbound: Box::new(sq_client),
+        inbounds: vec![("socks".to_string(), Box::new(socks_server))],
+        router: Arc::new(client_router),
     };
 
     let sq_server = ShadowQuicServer::new(ShadowQuicServerCfg {
@@ -282,13 +309,36 @@ async fn shadowquic_client_server(over_stream: bool, port: u16) {
     })
     .unwrap();
     let direct_client = DirectOut::new(DirectOutCfg::default());
+
+    let mut server_outbounds = HashMap::new();
+    server_outbounds.insert(
+        "direct".to_string(),
+        Arc::new(Mutex::new(
+            Box::new(direct_client) as Box<dyn shadowquic::Outbound>
+        )),
+    );
+    let server_router = Router::new(vec![], server_outbounds, Some("direct".to_string())).unwrap();
+
     let server = Manager {
-        inbound: Box::new(sq_server),
-        outbound: Box::new(direct_client),
+        inbounds: vec![("sq".to_string(), Box::new(sq_server))],
+        router: Arc::new(server_router),
     };
 
     tokio::spawn(server.run());
 
     tokio::spawn(client.run());
     tokio::time::sleep(Duration::from_millis(200)).await;
+}
+
+async fn spawn_udp_echo(port: u16) {
+    let udp = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, port))
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 2048];
+        loop {
+            let (len, peer) = udp.recv_from(&mut buf).await.unwrap();
+            let _ = udp.send_to(&buf[..len], peer).await;
+        }
+    });
 }

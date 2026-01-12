@@ -1,13 +1,19 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use tracing::Level;
 
+use crate::router::Router;
 use crate::{
     Inbound, Manager, Outbound,
     direct::outbound::DirectOut,
     error::SError,
+    http::inbound::HttpServer,
     shadowquic::{inbound::ShadowQuicServer, outbound::ShadowQuicClient},
     socks::{inbound::SocksServer, outbound::SocksClient},
+    tun::TunInbound,
 };
 
 #[cfg(target_os = "android")]
@@ -20,9 +26,11 @@ use std::path::PathBuf;
 /// inbound:
 ///   type: xxx
 ///   xxx: xxx
-/// outbound:
-///   type: xxx
-///   xxx: xxx
+/// outbounds:
+///   out1:
+///     type: xxx
+///     xxx: xxx
+/// final: out1
 /// log-level: trace # or debug, info, warn, error
 /// ```
 /// Supported inbound types are listed in [`InboundCfg`]
@@ -31,18 +39,82 @@ use std::path::PathBuf;
 #[derive(Deserialize, Clone, Debug)]
 #[serde(rename_all = "kebab-case")]
 pub struct Config {
-    pub inbound: InboundCfg,
-    pub outbound: OutboundCfg,
+    #[serde(default)]
+    pub inbounds: Vec<InboundCfg>,
+    pub inbound: Option<InboundCfg>,
+    pub outbounds: HashMap<String, OutboundCfg>,
+    #[serde(default)]
+    pub rules: Vec<Rule>,
+    pub final_out: Option<String>,
+    #[serde(rename = "final")]
+    pub final_out_legacy: Option<String>,
+    #[serde(rename = "select")]
+    pub select_legacy: Option<String>,
     #[serde(default)]
     pub log_level: LogLevel,
 }
 impl Config {
     pub async fn build_manager(self) -> Result<Manager, SError> {
+        let mut outbounds = HashMap::new();
+        for (tag, cfg) in self.outbounds {
+            let out = cfg.build_outbound().await?;
+            outbounds.insert(tag, Arc::new(Mutex::new(out)));
+        }
+
+        let mut inbounds = Vec::new();
+        if let Some(inbound) = self.inbound {
+            inbounds.push(inbound.build_inbound().await?);
+        }
+        for inbound in self.inbounds {
+            inbounds.push(inbound.build_inbound().await?);
+        }
+
+        if inbounds.is_empty() {
+            return Err(SError::SocksError("No inbound configured".to_string()));
+        }
+
+        let default_out = self
+            .final_out
+            .or(self.final_out_legacy)
+            .or(self.select_legacy);
+
+        let router = Router::new(self.rules, outbounds, default_out)
+            .map_err(|e| SError::SocksError(e.to_string()))?;
+
         Ok(Manager {
-            inbound: self.inbound.build_inbound().await?,
-            outbound: self.outbound.build_outbound().await?,
+            inbounds,
+            router: Arc::new(router),
         })
     }
+}
+
+#[derive(Deserialize, Clone, Debug)]
+#[serde(rename_all = "kebab-case")]
+pub struct Rule {
+    pub inbound: Option<Vec<String>>,
+    pub domain: Option<Vec<String>>,
+    pub ip: Option<Vec<String>>,
+    pub outbound: String,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+#[serde(rename_all = "kebab-case")]
+pub struct InboundCfg {
+    #[serde(default = "default_inbound_tag")]
+    pub tag: String,
+    #[serde(flatten)]
+    pub inner: InboundType,
+}
+
+impl InboundCfg {
+    async fn build_inbound(self) -> Result<(String, Box<dyn Inbound>), SError> {
+        let inbound = self.inner.build_inbound().await?;
+        Ok((self.tag, inbound))
+    }
+}
+
+fn default_inbound_tag() -> String {
+    "default".to_string()
 }
 
 /// Inbound configuration
@@ -56,16 +128,20 @@ impl Config {
 #[derive(Deserialize, Clone, Debug)]
 #[serde(rename_all = "kebab-case")]
 #[serde(tag = "type")]
-pub enum InboundCfg {
+pub enum InboundType {
     Socks(SocksServerCfg),
+    Http(HttpServerCfg),
+    Tun(TunInboundCfg),
     #[serde(rename = "shadowquic")]
     ShadowQuic(ShadowQuicServerCfg),
 }
-impl InboundCfg {
+impl InboundType {
     async fn build_inbound(self) -> Result<Box<dyn Inbound>, SError> {
         let r: Box<dyn Inbound> = match self {
-            InboundCfg::Socks(cfg) => Box::new(SocksServer::new(cfg).await?),
-            InboundCfg::ShadowQuic(cfg) => Box::new(ShadowQuicServer::new(cfg)?),
+            InboundType::Socks(cfg) => Box::new(SocksServer::new(cfg).await?),
+            InboundType::Http(cfg) => Box::new(HttpServer::new(cfg).await?),
+            InboundType::Tun(cfg) => Box::new(TunInbound::new(cfg)?),
+            InboundType::ShadowQuic(cfg) => Box::new(ShadowQuicServer::new(cfg)?),
         };
         Ok(r)
     }
@@ -120,6 +196,29 @@ pub struct SocksServerCfg {
     pub users: Vec<AuthUser>,
 }
 
+/// Http inbound configuration
+#[derive(Deserialize, Clone, Debug)]
+#[serde(rename_all = "kebab-case")]
+pub struct HttpServerCfg {
+    /// Server binding address.
+    pub bind_addr: SocketAddr,
+    /// Http username, optional
+    /// Left empty to disable authentication
+    #[serde(default = "Vec::new")]
+    pub users: Vec<AuthUser>,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+#[serde(rename_all = "kebab-case")]
+pub struct TunInboundCfg {
+    pub name: Option<String>,
+    pub ipv4_cidr: Option<String>,
+    pub ipv6_cidr: Option<String>,
+    pub mtu: Option<u16>,
+    pub flow_timeout_secs: Option<u64>,
+    pub auto_route: Option<bool>,
+}
+
 /// user authentication
 #[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -141,6 +240,7 @@ pub struct SocksClientCfg {
     pub username: Option<String>,
     /// SOCKS5 password, optional
     pub password: Option<String>,
+    pub bind_interface: Option<String>,
 }
 
 /// Shadowquic outbound configuration
@@ -208,6 +308,7 @@ pub struct ShadowQuicClientCfg {
     /// Android Only. the unix socket path for protecting android socket
     #[cfg(target_os = "android")]
     pub protect_path: Option<PathBuf>,
+    pub bind_interface: Option<String>,
 }
 
 impl Default for ShadowQuicClientCfg {
@@ -228,6 +329,7 @@ impl Default for ShadowQuicClientCfg {
             port_hopping: None,
             #[cfg(target_os = "android")]
             protect_path: Default::default(),
+            bind_interface: None,
         }
     }
 }
@@ -278,6 +380,7 @@ pub enum CongestionControl {
 pub struct DirectOutCfg {
     #[serde(default)]
     pub dns_strategy: DnsStrategy,
+    pub bind_interface: Option<String>,
 }
 /// DNS resolution strategy
 /// Default is `prefer-ipv4``
@@ -447,9 +550,11 @@ mod test {
 inbound:
     type: socks
     bind-addr: 127.0.0.1:1089
-outbound:
-    type: direct
-    dns-strategy: prefer-ipv4
+outbounds:
+    direct:
+        type: direct
+        dns-strategy: prefer-ipv4
+select: direct
 "###;
         let _cfg: Config = serde_yaml::from_str(cfgstr).expect("yaml parsed failed");
     }
@@ -473,17 +578,19 @@ inbound:
     users: []
     jls-upstream:
         addr: "google.com:443"
-outbound:
-    type: shadowquic
-    addr: "127.0.0.1:443"
-    port-hopping: [1000, 1001]
-    username: "u"
-    password: "p"
-    server-name: "s"
+outbounds:
+    sq:
+        type: shadowquic
+        addr: "127.0.0.1:443"
+        port-hopping: [1000, 1001]
+        username: "u"
+        password: "p"
+        server-name: "s"
+select: sq
 "###;
         let cfg: Config = serde_yaml::from_str(cfgstr).expect("yaml parsed failed");
 
-        if let super::InboundCfg::ShadowQuic(sq) = cfg.inbound {
+        if let super::InboundType::ShadowQuic(sq) = cfg.inbound.unwrap().inner {
             assert!(sq.port_hopping.is_some());
             match sq.port_hopping.unwrap() {
                 PortHopping::Range(s) => assert_eq!(s, "1000-1002"),
@@ -493,10 +600,10 @@ outbound:
             panic!("Expected ShadowQuic inbound");
         }
 
-        if let super::OutboundCfg::ShadowQuic(sq) = cfg.outbound {
+        if let super::OutboundCfg::ShadowQuic(sq) = cfg.outbounds.get("sq").unwrap() {
             assert!(sq.port_hopping.is_some());
-            match sq.port_hopping.unwrap() {
-                PortHopping::List(l) => assert_eq!(l, vec![1000, 1001]),
+            match sq.port_hopping.as_ref().unwrap() {
+                PortHopping::List(l) => assert_eq!(l, &vec![1000, 1001]),
                 _ => panic!("Expected List"),
             }
         } else {

@@ -125,6 +125,31 @@ impl QuicClient for Endpoint {
         if ipv6 {
             socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
             let bind_addr: SocketAddr = "[::]:0".parse().unwrap();
+
+            if let Some(iface) = &cfg.bind_interface {
+                #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+                socket.bind_device(Some(iface.as_bytes()))?;
+                #[cfg(target_os = "macos")]
+                {
+                    let index = unsafe {
+                        let name = std::ffi::CString::new(iface.as_str())
+                            .map_err(|_| io::Error::other("invalid interface name"))?;
+                        libc::if_nametoindex(name.as_ptr())
+                    };
+                    if index != 0 {
+                        socket.bind_device_by_index_v6(Some(
+                            std::num::NonZeroU32::new(index).unwrap(),
+                        ))?;
+                    } else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            format!("interface {} not found", iface),
+                        )
+                        .into());
+                    }
+                }
+            }
+
             if let Err(e) = socket.set_only_v6(false) {
                 tracing::warn!(%e, "unable to make socket dual-stack");
             }
@@ -132,6 +157,31 @@ impl QuicClient for Endpoint {
         } else {
             socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
             let bind_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
+
+            if let Some(iface) = &cfg.bind_interface {
+                #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+                socket.bind_device(Some(iface.as_bytes()))?;
+                #[cfg(target_os = "macos")]
+                {
+                    let index = unsafe {
+                        let name = std::ffi::CString::new(iface.as_str())
+                            .map_err(|_| io::Error::other("invalid interface name"))?;
+                        libc::if_nametoindex(name.as_ptr())
+                    };
+                    if index != 0 {
+                        socket.bind_device_by_index_v4(Some(
+                            std::num::NonZeroU32::new(index).unwrap(),
+                        ))?;
+                    } else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            format!("interface {} not found", iface),
+                        )
+                        .into());
+                    }
+                }
+            }
+
             socket.bind(&bind_addr.into())?;
         }
 
