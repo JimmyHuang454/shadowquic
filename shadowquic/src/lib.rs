@@ -97,7 +97,86 @@ impl UdpRecv for Receiver<(Bytes, SocksAddr)> {
         Ok(r)
     }
 }
-use crate::router::Router;
+use crate::router::{OutboundStats, Router};
+use crate::utils::{format_bytes, format_duration};
+
+pub struct SessionObserver {
+    stats: Option<Arc<OutboundStats>>,
+    dst: SocksAddr,
+    start_time: Instant,
+}
+
+impl SessionObserver {
+    pub fn new(stats: Option<Arc<OutboundStats>>, dst: SocksAddr, start_time: Instant) -> Self {
+        Self { stats, dst, start_time }
+    }
+
+    pub fn on_start(&self) {
+        if let Some(ref s) = self.stats {
+            s.on_request_start();
+        }
+    }
+
+    pub fn on_handle_error(&self) {
+        if let Some(ref s) = self.stats {
+            s.on_request_error();
+            trace!(
+                "outbound {} stats: current: {}, total: {}, upload: {}, download: {}",
+                s.tag(),
+                s.current_connections(),
+                s.total_connections(),
+                s.upload_bytes(),
+                s.download_bytes()
+            );
+        }
+    }
+
+    pub async fn observe(self, rx: tokio::sync::oneshot::Receiver<(u64, u64)>) {
+        let stats = self.stats;
+        let result = rx.await;
+        match (stats, result) {
+            (Some(stats), Ok((upload, download))) => {
+                stats.on_request_finish(upload, download);
+                trace!(
+                    "request to {} finished, upload: {}, download: {}, cost: {}",
+                    self.dst,
+                    format_bytes(upload),
+                    format_bytes(download),
+                    format_duration(self.start_time.elapsed())
+                );
+                trace!(
+                    "outbound {} stats: current: {}, total: {}, upload: {}, download: {}",
+                    stats.tag(),
+                    stats.current_connections(),
+                    stats.total_connections(),
+                    format_bytes(stats.upload_bytes()),
+                    format_bytes(stats.download_bytes())
+                );
+            }
+            (Some(stats), Err(_)) => {
+                stats.on_request_error();
+                trace!(
+                    "outbound {} stats: current: {}, total: {}, upload: {}, download: {}",
+                    stats.tag(),
+                    stats.current_connections(),
+                    stats.total_connections(),
+                    format_bytes(stats.upload_bytes()),
+                    format_bytes(stats.download_bytes())
+                );
+            }
+            (None, Ok((upload, download))) => {
+                trace!(
+                    "request to {} finished, upload: {}, download: {}, cost: {}",
+                    self.dst,
+                    format_bytes(upload),
+                    format_bytes(download),
+                    format_duration(self.start_time.elapsed())
+                );
+            }
+            (None, Err(_)) => {}
+        }
+    }
+}
 
 pub struct Manager {
     pub inbounds: Vec<(String, Box<dyn Inbound>)>,
@@ -118,27 +197,22 @@ impl Manager {
                 loop {
                     match inbound.accept().await {
                         Ok(req) => {
-                            let outbound = router.route(&tag, &req);
+                            let (outbound, stats) = router.route(&tag, &req);
                             let mut out = outbound.lock().await;
                             let (dst, start_time) = match &req {
                                 ProxyRequest::Tcp(s) => (s.dst.clone(), s.start_time),
                                 ProxyRequest::Udp(s) => (s.dst.clone(), s.start_time),
                             };
+                            let observer = SessionObserver::new(stats, dst, start_time);
+                            observer.on_start();
                             match out.handle(req).await {
                                 Ok(rx) => {
                                     tokio::spawn(async move {
-                                        if let Ok((upload, download)) = rx.await {
-                                            trace!(
-                                                "request to {} finished, upload: {}, download: {}, cost: {:?}",
-                                                dst,
-                                                upload,
-                                                download,
-                                                start_time.elapsed()
-                                            );
-                                        }
+                                        observer.observe(rx).await;
                                     });
                                 }
                                 Err(e) => {
+                                    observer.on_handle_error();
                                     error!("error during handling request: {}", e)
                                 }
                             }

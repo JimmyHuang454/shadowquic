@@ -1,5 +1,5 @@
 inbounds:
-  - tag: sq-in
+  sq-in:
     type: shadowquic
     bind-addr: "0.0.0.0:1443"
     users:

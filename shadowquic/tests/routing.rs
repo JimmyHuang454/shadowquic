@@ -184,7 +184,7 @@ async fn test_routing_rules() {
     // Create Router
     use shadowquic::router::Router;
 
-    let router = Router::new(rules, outbounds_map, Some("out_b".to_string())).unwrap();
+    let router = Router::new(rules, outbounds_map, Some("out_b".to_string()), true).unwrap();
 
     let manager = Manager {
         inbounds: vec![
@@ -229,19 +229,33 @@ async fn test_routing_rules() {
         // We wait a bit to ensure the notification happens.
     }
 
+    let timeout = std::time::Duration::from_secs(10);
+
     // Case 1: in_1 -> google.com -> should match domain rule -> out_a
-    request(addr_in_1, "google.com", 80).await;
-    notify_a.notified().await;
+    tokio::time::timeout(timeout, async {
+        request(addr_in_1, "google.com", 80).await;
+        notify_a.notified().await;
+    })
+    .await
+    .expect("case 1 timeout");
     println!("Case 1 passed: google.com -> out_a");
 
     // Case 2: in_1 -> 1.1.1.1 -> should match ip rule -> out_a
-    request(addr_in_1, "1.1.1.1", 80).await;
-    notify_a.notified().await;
+    tokio::time::timeout(timeout, async {
+        request(addr_in_1, "1.1.1.1", 80).await;
+        notify_a.notified().await;
+    })
+    .await
+    .expect("case 2 timeout");
     println!("Case 2 passed: 1.1.1.1 -> out_a");
 
     // Case 3: in_1 -> example.com -> no match -> default -> out_b
-    request(addr_in_1, "example.com", 80).await;
-    notify_b.notified().await;
+    tokio::time::timeout(timeout, async {
+        request(addr_in_1, "example.com", 80).await;
+        notify_b.notified().await;
+    })
+    .await
+    .expect("case 3 timeout");
     println!("Case 3 passed: example.com -> out_b (default)");
 
     // Case 4: in_2 -> google.com -> should match inbound rule (priority?) -> out_b
@@ -250,7 +264,11 @@ async fn test_routing_rules() {
     //   2. domain: ["google.com"] -> out_a
     // The router iterates rules in order. First match wins.
     // So if "in_2" rule is first, it should go to out_b.
-    request(addr_in_2, "google.com", 80).await;
-    notify_b.notified().await;
+    tokio::time::timeout(timeout, async {
+        request(addr_in_2, "google.com", 80).await;
+        notify_b.notified().await;
+    })
+    .await
+    .expect("case 4 timeout");
     println!("Case 4 passed: in_2 -> google.com -> out_b (inbound rule priority)");
 }

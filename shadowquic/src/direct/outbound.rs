@@ -1,22 +1,14 @@
-use std::{
-    collections::HashMap,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs},
-    sync::Arc,
-};
+use std::{net::ToSocketAddrs, sync::Arc};
 
 use bytes::BytesMut;
-use tokio::{
-    net::{TcpStream, lookup_host},
-    sync::Mutex,
-};
+use tokio::net::TcpStream;
 use tracing::{Instrument, error, trace, trace_span};
 
 use crate::{
     Outbound, UdpSession,
-    config::{DirectOutCfg, DnsStrategy},
+    config::DirectOutCfg,
     error::SError,
-    msgs::socks5::{AddrOrDomain, SOCKS5_ADDR_TYPE_DOMAIN_NAME, SocksAddr, VarVec},
-    utils::dual_socket::DualSocket,
+    utils::{self, bidirectional_copy, dual_socket::DualSocket},
 };
 use async_trait::async_trait;
 
@@ -33,24 +25,34 @@ impl Outbound for DirectOut {
     ) -> Result<tokio::sync::oneshot::Receiver<(u64, u64)>, crate::error::SError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let dns_strategy = self.cfg.dns_strategy.clone();
+        let doh_cfg = self.cfg.dns_over_https.clone();
         let self_clone = self.clone();
         let fut = async move {
             let res = async {
                 match req {
                     crate::ProxyRequest::Tcp(mut tcp_session) => {
-                        trace!("direct tcp to {}", tcp_session.dst);
-                        let dst = tcp_session.dst.to_socket_addrs()?;
-                        let dst = apply_dns_strategy(dst, &dns_strategy)
-                            .ok_or(SError::DomainResolveFailed(tcp_session.dst.to_string()))?;
-                        trace!("resolved to {}", dst);
-                        let mut upstream = TcpStream::connect(dst).await?;
-                        let (upload, download) = tokio::io::copy_bidirectional_with_sizes(
-                            &mut tcp_session.inner.stream,
-                            &mut upstream,
-                            1024 * 16,
-                            1024 * 16,
+                        trace!(
+                            "direct tcp to {} cost: {:?}",
+                            tcp_session.dst,
+                            tcp_session.start_time.elapsed()
+                        );
+
+                        let dst = utils::dns::resolve_socks_addr(
+                            &tcp_session.dst,
+                            &dns_strategy,
+                            doh_cfg.as_ref(),
                         )
                         .await?;
+                        trace!(
+                            "resolved {} to {} cost: {:?}",
+                            tcp_session.dst,
+                            dst,
+                            tcp_session.start_time.elapsed()
+                        );
+                        let mut upstream = TcpStream::connect(dst).await?;
+                        let (upload, download) =
+                            bidirectional_copy(&mut tcp_session.inner.stream, &mut upstream)
+                                .await?;
                         Ok((upload, download))
                     }
                     crate::ProxyRequest::Udp(udp_session) => {
@@ -68,7 +70,7 @@ impl Outbound for DirectOut {
                 }
                 Err(e) => {
                     let _ = tx.send((0, 0)); // Send 0s on error? Or drop tx?
-                                             // If we drop tx, rx.await fails.
+                    // If we drop tx, rx.await fails.
                     Err(e)
                 }
             }
@@ -84,68 +86,9 @@ impl Outbound for DirectOut {
         Ok(rx)
     }
 }
-
-#[derive(Default, Clone)]
-struct DnsResolve(Arc<Mutex<HashMap<Vec<u8>, SocketAddr>>>);
-impl DnsResolve {
-    async fn resolve(
-        &self,
-        socks: SocksAddr,
-        strategy: &DnsStrategy,
-    ) -> Result<SocketAddr, SError> {
-        if let AddrOrDomain::Domain(x) = &socks.addr {
-            if let Some(v) = self.0.lock().await.get(&x.contents) {
-                Ok(*v)
-            } else {
-                let s = resolve(&socks, strategy).await?;
-                self.0.lock().await.insert(x.contents.clone(), s);
-                Ok(s)
-            }
-        } else {
-            Ok(resolve(&socks, strategy).await?)
-        }
-    }
-    async fn inv_resolve(&self, addr: &SocketAddr) -> SocksAddr {
-        if let Some(add) = self.0.lock().await.iter().find(|x| x.1 == addr) {
-            SocksAddr {
-                atype: SOCKS5_ADDR_TYPE_DOMAIN_NAME,
-                addr: AddrOrDomain::Domain(VarVec {
-                    len: add.0.len() as u8,
-                    contents: add.0.clone(),
-                }),
-                port: addr.port(),
-            }
-        } else {
-            (*addr).into()
-        }
-    }
-}
-
-async fn resolve(socks: &SocksAddr, strategy: &DnsStrategy) -> Result<SocketAddr, SError> {
-    let mut s = match socks.addr.clone() {
-        crate::msgs::socks5::AddrOrDomain::V4(x) => {
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::from(x)), 0)
-        }
-        crate::msgs::socks5::AddrOrDomain::V6(x) => {
-            SocketAddr::new(IpAddr::V6(Ipv6Addr::from(x)), 0)
-        }
-        crate::msgs::socks5::AddrOrDomain::Domain(var_vec) => {
-            let ip_list = lookup_host((
-                String::from_utf8(var_vec.contents)
-                    .map_err(|_| SError::DomainResolveFailed(socks.to_string()))?,
-                socks.port,
-            ))
-            .await?;
-            apply_dns_strategy(ip_list, strategy)
-                .ok_or(SError::DomainResolveFailed(socks.to_string()))?
-        }
-    };
-    s.set_port(socks.port);
-    Ok(s)
-}
-
 impl DirectOut {
     pub fn new(cfg: DirectOutCfg) -> Self {
+        crate::utils::dns::init_dns_from_direct_cfg(&cfg);
         Self { cfg }
     }
 
@@ -165,9 +108,10 @@ impl DirectOut {
         let upstream_clone = upstream.clone();
         let mut downstream = udp_session.inner.recv;
 
-        let dns_cache = DnsResolve::default();
+        let dns_cache = utils::dns::DnsResolve::default();
         let dns_cache_clone = dns_cache.clone();
         let dns_strategy = self.cfg.dns_strategy.clone();
+        let doh_cfg = self.cfg.dns_over_https.clone();
         let fut1 = async move {
             loop {
                 let mut buf_send = BytesMut::new();
@@ -179,7 +123,11 @@ impl DirectOut {
                 //trace!("udp source inverse resolved to:{}", dst);
                 let buf = buf_send.freeze();
                 //trace!("udp recved:{} bytes", len);
-                let _ = udp_session.inner.send.send_to(buf.slice(..len), dst).await?;
+                let _ = udp_session
+                    .inner
+                    .send
+                    .send_to(buf.slice(..len), dst)
+                    .await?;
             }
             #[allow(unreachable_code)]
             (Ok(()) as Result<(), SError>)
@@ -188,8 +136,9 @@ impl DirectOut {
             loop {
                 let (buf, dst) = downstream.recv_from().await?;
 
-                //trace!("udp request to:{}", dst);
-                let dst = dns_cache.resolve(dst, &dns_strategy).await?;
+                let dst = dns_cache
+                    .resolve(dst, &dns_strategy, doh_cfg.as_ref())
+                    .await?;
                 //trace!("udp resolve to:{}", dst);
                 let _siz = upstream_clone.send_to(&buf, &dst).await?;
                 //trace!("udp request sent:{}bytes", siz);
@@ -201,87 +150,5 @@ impl DirectOut {
         // Flatten spawn handle using try_join! doesn't work. Don't know why
         tokio::try_join!(fut1, fut2)?;
         Ok(())
-    }
-}
-fn apply_dns_strategy<It>(mut ip_list: It, strategy: &DnsStrategy) -> Option<SocketAddr>
-where
-    It: Iterator<Item = SocketAddr>,
-{
-    match strategy {
-        DnsStrategy::Ipv4Only => ip_list.find(|addr| addr.is_ipv4()),
-        DnsStrategy::Ipv6Only => ip_list.find(|addr| addr.is_ipv6()),
-        DnsStrategy::PreferIpv4 => {
-            let mut first = None;
-            for ip in ip_list {
-                if ip.is_ipv4() {
-                    return Some(ip);
-                }
-                if first.is_none() {
-                    first = Some(ip);
-                }
-            }
-            first
-        }
-        DnsStrategy::PreferIpv6 => {
-            let mut first = None;
-            for ip in ip_list {
-                if ip.is_ipv6() {
-                    return Some(ip);
-                }
-                if first.is_none() {
-                    first = Some(ip);
-                }
-            }
-            first
-        }
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    fn make_addrs() -> Vec<SocketAddr> {
-        vec![
-            // 127.0.0.1:8080 (IPv4)
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
-            // ::1:8080 (IPv6)
-            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 8080),
-        ]
-    }
-
-    #[test]
-    fn test_apply_dns_strategy_ipv4_only() {
-        let addrs = make_addrs();
-        let result = apply_dns_strategy(addrs.clone().into_iter(), &DnsStrategy::Ipv4Only);
-        assert_eq!(result, Some(addrs[0]));
-    }
-
-    #[test]
-    fn test_apply_dns_strategy_ipv6_only() {
-        let addrs = make_addrs();
-        let result = apply_dns_strategy(addrs.clone().into_iter(), &DnsStrategy::Ipv6Only);
-        assert_eq!(result, Some(addrs[1]));
-    }
-
-    #[test]
-    fn test_apply_dns_strategy_prefer_ipv4() {
-        let addrs = make_addrs();
-        let result = apply_dns_strategy(addrs.clone().into_iter(), &DnsStrategy::PreferIpv4);
-        assert_eq!(result, Some(addrs[0]));
-    }
-
-    #[test]
-    fn test_apply_dns_strategy_prefer_ipv6() {
-        let addrs = make_addrs();
-        let result = apply_dns_strategy(addrs.clone().into_iter(), &DnsStrategy::PreferIpv6);
-        assert_eq!(result, Some(addrs[1]));
-    }
-
-    #[test]
-    fn test_apply_dns_strategy_empty() {
-        let addrs: Vec<SocketAddr> = vec![];
-        let result = apply_dns_strategy(addrs.into_iter(), &DnsStrategy::PreferIpv4);
-        assert_eq!(result, None);
     }
 }

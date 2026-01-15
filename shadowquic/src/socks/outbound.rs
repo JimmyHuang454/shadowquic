@@ -9,11 +9,9 @@ use crate::{
     },
     socks::UdpSocksWrap,
 };
-use tokio::{
-    io::{AsyncReadExt, copy_bidirectional_with_sizes},
-    net::TcpStream,
-    sync::OnceCell,
-};
+use tokio::io::AsyncReadExt;
+use tokio::net::TcpStream;
+use tokio::sync::OnceCell;
 
 use async_trait::async_trait;
 use tracing::{Instrument, error, trace_span};
@@ -23,6 +21,7 @@ use crate::{
     config::SocksClientCfg,
     error::SError,
     msgs::socks5::{AuthReply, AuthReq, CmdReq, SDecode, SEncode, SOCKS5_AUTH_METHOD_NONE, VarVec},
+    utils::bidirectional_copy,
 };
 
 #[derive(Debug, Clone)]
@@ -35,7 +34,10 @@ pub struct SocksClient {
 
 #[async_trait]
 impl Outbound for SocksClient {
-    async fn handle(&mut self, req: ProxyRequest) -> Result<tokio::sync::oneshot::Receiver<(u64, u64)>, SError> {
+    async fn handle(
+        &mut self,
+        req: ProxyRequest,
+    ) -> Result<tokio::sync::oneshot::Receiver<(u64, u64)>, SError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let span = trace_span!("socks", server = self.addr);
         let client = self.clone();
@@ -145,13 +147,8 @@ impl SocksClient {
         socksreq.encode(&mut tcp).await?;
         let _rep = CmdReply::decode(&mut tcp).await?;
         tracing::trace!("socks tcp connection established");
-        let (upload, download) = copy_bidirectional_with_sizes(
-            &mut tcp,
-            &mut tcp_session.inner.stream,
-            16 * 1024,
-            16 * 1024,
-        )
-        .await?;
+        let (upload, download) =
+            bidirectional_copy(&mut tcp, &mut tcp_session.inner.stream).await?;
         Ok((upload, download))
     }
 

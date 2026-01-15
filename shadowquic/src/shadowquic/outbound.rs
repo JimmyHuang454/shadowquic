@@ -26,6 +26,7 @@ use crate::{
     },
     quic::{QuicClient, QuicConnection},
     shadowquic::{handle_udp_recv_ctrl, handle_udp_send},
+    utils::bidirectional_copy,
 };
 
 use super::{IDStore, SQConn, handle_udp_packet_recv, inbound::Unsplit};
@@ -142,12 +143,10 @@ impl Outbound for ShadowQuicClient {
                         req.encode(&mut send).await?;
                         trace!("tcp connect req header sent");
 
-                        let u = tokio::io::copy_bidirectional(
-                            &mut Unsplit { s: send, r: recv },
-                            &mut tcp_session.inner.stream,
-                        )
-                        .await?;
-                        Ok((u.1, u.0))
+                        let (download, upload) =
+                            bidirectional_copy(&mut Unsplit { s: send, r: recv }, &mut tcp_session.inner.stream)
+                                .await?;
+                        Ok((upload, download))
                     }
                     crate::ProxyRequest::Udp(udp_session) => {
                         info!("bistream opened for udp dst:{}", udp_session.dst.clone());

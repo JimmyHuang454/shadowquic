@@ -193,7 +193,8 @@ async fn spawn_socks_server() {
             Box::new(direct_client) as Box<dyn shadowquic::Outbound>
         )),
     );
-    let server_router = Router::new(vec![], server_outbounds, Some("direct".to_string())).unwrap();
+    let server_router =
+        Router::new(vec![], server_outbounds, Some("direct".to_string()), true).unwrap();
 
     let server = Manager {
         inbounds: vec![("socks".to_string(), Box::new(socks_server))],
@@ -284,7 +285,8 @@ async fn shadowquic_client_server(over_stream: bool, port: u16) {
             Box::new(sq_client) as Box<dyn shadowquic::Outbound>
         )),
     );
-    let client_router = Router::new(vec![], client_outbounds, Some("sq".to_string())).unwrap();
+    let client_router =
+        Router::new(vec![], client_outbounds, Some("sq".to_string()), true).unwrap();
 
     let client = Manager {
         inbounds: vec![("socks".to_string(), Box::new(socks_server))],
@@ -317,7 +319,8 @@ async fn shadowquic_client_server(over_stream: bool, port: u16) {
             Box::new(direct_client) as Box<dyn shadowquic::Outbound>
         )),
     );
-    let server_router = Router::new(vec![], server_outbounds, Some("direct".to_string())).unwrap();
+    let server_router =
+        Router::new(vec![], server_outbounds, Some("direct".to_string()), true).unwrap();
 
     let server = Manager {
         inbounds: vec![("sq".to_string(), Box::new(sq_server))],
