@@ -9,9 +9,10 @@ use tokio::net::lookup_host;
 use url::Url;
 
 use crate::{
-    config::{DirectOutCfg, DnsOverHttpsCfg, DnsStrategy},
+    config::{DirectOutCfg, DnsCfg, DnsOverHttpsCfg, DnsStrategy},
     error::SError,
     msgs::socks5::{AddrOrDomain, SocksAddr, VarVec},
+    utils::dns_cache::{DnsFoyerCache, DnsCacheValue, create_dns_cache, DnsCacheExt},
 };
 
 #[derive(Default, Clone)]
@@ -25,13 +26,14 @@ pub struct DnsRuntimeConfig {
     pub negative_min_ttl: Option<std::time::Duration>,
     pub negative_max_ttl: Option<std::time::Duration>,
     pub udp_server: Option<SocketAddr>,
+    pub foyer_cache: Option<DnsFoyerCache>,
 }
 
 static DNS_RUNTIME_CONFIG: std::sync::OnceLock<DnsRuntimeConfig> = std::sync::OnceLock::new();
 static DEFAULT_RESOLVER: std::sync::OnceLock<Resolver<TokioConnectionProvider>> =
     std::sync::OnceLock::new();
 
-pub fn init_dns_from_direct_cfg(cfg: &DirectOutCfg) {
+pub async fn init_dns_from_direct_cfg(cfg: &DnsCfg) {
     let udp_server = cfg.dns_server.as_ref().and_then(|s| {
         // Expect format like udp://8.8.8.8:53
         if let Ok(url) = Url::parse(s) {
@@ -47,6 +49,12 @@ pub fn init_dns_from_direct_cfg(cfg: &DirectOutCfg) {
         }
     });
 
+    let foyer_cache = create_dns_cache(
+        cfg.dns_memory_cache_capacity,
+        cfg.dns_disk_cache_capacity,
+        cfg.dns_disk_cache_path.clone(),
+    ).await;
+
     let runtime_cfg = DnsRuntimeConfig {
         cache_size: cfg.dns_cache_size,
         positive_min_ttl: cfg.dns_positive_min_ttl.map(std::time::Duration::from_secs),
@@ -54,6 +62,7 @@ pub fn init_dns_from_direct_cfg(cfg: &DirectOutCfg) {
         negative_min_ttl: cfg.dns_negative_min_ttl.map(std::time::Duration::from_secs),
         negative_max_ttl: cfg.dns_negative_max_ttl.map(std::time::Duration::from_secs),
         udp_server,
+        foyer_cache,
     };
     let _ = DNS_RUNTIME_CONFIG.set(runtime_cfg);
 }
@@ -62,10 +71,9 @@ impl DnsResolve {
     pub async fn resolve(
         &self,
         socks: SocksAddr,
-        strategy: &DnsStrategy,
-        doh: Option<&DnsOverHttpsCfg>,
-    ) -> Result<SocketAddr, SError> {
-        resolve_socks_addr(&socks, strategy, doh).await
+        cfg: &DnsCfg,
+    ) -> Result<DnsResolveResult, SError> {
+        resolve_socks_addr(&socks, cfg).await
     }
 
     pub async fn inv_resolve(&self, addr: &SocketAddr) -> SocksAddr {
@@ -73,28 +81,89 @@ impl DnsResolve {
     }
 }
 
+pub struct DnsResolveResult {
+    pub addr: SocketAddr,
+    pub cached: bool,
+}
+
 pub async fn resolve_socks_addr(
     socks: &SocksAddr,
-    strategy: &DnsStrategy,
-    doh: Option<&DnsOverHttpsCfg>,
-) -> Result<SocketAddr, SError> {
+    cfg: &DnsCfg,
+) -> Result<DnsResolveResult, SError> {
     let mut s = match socks.addr.clone() {
-        AddrOrDomain::V4(x) => SocketAddr::new(IpAddr::V4(Ipv4Addr::from(x)), 0),
-        AddrOrDomain::V6(x) => SocketAddr::new(IpAddr::V6(Ipv6Addr::from(x)), 0),
+        AddrOrDomain::V4(x) => DnsResolveResult {
+            addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::from(x)), 0),
+            cached: false,
+        },
+        AddrOrDomain::V6(x) => DnsResolveResult {
+            addr: SocketAddr::new(IpAddr::V6(Ipv6Addr::from(x)), 0),
+            cached: false,
+        },
         AddrOrDomain::Domain(var_vec) => {
             let host = String::from_utf8(var_vec.contents)
                 .map_err(|_| SError::DomainResolveFailed(socks.to_string()))?;
-            match doh {
-                Some(doh_cfg) => match resolve_via_doh(&host, socks.port, strategy, doh_cfg).await {
-                    Ok(addr) => addr,
-                    Err(_) => resolve_via_default_resolver(&host, socks.port, strategy).await?,
-                },
-                None => resolve_via_default_resolver(&host, socks.port, strategy).await?,
+
+            if let Some(runtime_cfg) = DNS_RUNTIME_CONFIG.get() {
+                if let Some(cache) = &runtime_cfg.foyer_cache {
+                    if let Some(val) = cache.get_ip(&host).await {
+                        let addrs = val.0
+                            .iter()
+                            .map(|&ip| SocketAddr::new(ip, socks.port))
+                            .collect::<Vec<_>>();
+                        if let Some(addr) = apply_dns_strategy(addrs.into_iter(), &cfg.dns_strategy) {
+                            return Ok(DnsResolveResult { addr, cached: true });
+                        }
+                    }
+                }
             }
+
+            let result_addr = match &cfg.dns_over_https {
+                Some(doh_cfg) => match resolve_via_doh(&host, socks.port, &cfg.dns_strategy, doh_cfg).await {
+                    Ok(addr) => addr,
+                    Err(_) => resolve_via_default_resolver(&host, socks.port, &cfg.dns_strategy).await?,
+                },
+                None => resolve_via_default_resolver(&host, socks.port, &cfg.dns_strategy).await?,
+            };
+
+            if let Some(runtime_cfg) = DNS_RUNTIME_CONFIG.get() {
+                if let Some(cache) = &runtime_cfg.foyer_cache {
+                    cache.insert_ip(host, DnsCacheValue(vec![result_addr.ip()]));
+                }
+            }
+            DnsResolveResult { addr: result_addr, cached: false }
         }
     };
-    s.set_port(socks.port);
+    s.addr.set_port(socks.port);
     Ok(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ip_socks_addr_resolve_does_not_mark_cached() {
+        let addr: SocketAddr = "33.22.22.1:80".parse().unwrap();
+        let socks = SocksAddr::from(addr);
+        let cfg = DnsCfg {
+            tag: "test".to_string(),
+            dns_strategy: DnsStrategy::PreferIpv4,
+            dns_over_https: None,
+            dns_server: None,
+            dns_cache_size: None,
+            dns_memory_cache_capacity: None,
+            dns_disk_cache_capacity: None,
+            dns_disk_cache_path: None,
+            dns_positive_min_ttl: None,
+            dns_positive_max_ttl: None,
+            dns_negative_min_ttl: None,
+            dns_negative_max_ttl: None,
+        };
+
+        let res = resolve_socks_addr(&socks, &cfg).await.unwrap();
+        assert_eq!(res.addr, addr);
+        assert!(!res.cached);
+    }
 }
 
 fn make_resolver_opts() -> ResolverOpts {

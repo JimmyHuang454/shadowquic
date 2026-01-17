@@ -1,5 +1,6 @@
 pub mod dual_socket;
 pub mod dns;
+pub mod dns_cache;
 pub mod route;
 pub mod socket;
 

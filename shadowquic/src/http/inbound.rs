@@ -1,53 +1,82 @@
-use crate::config::{AuthUser, HttpServerCfg};
+use crate::config::HttpServerCfg;
 use crate::error::SError;
 use crate::msgs::socks5::SocksAddr;
-use crate::{Inbound, ProxyRequest, TcpInner, TcpSession};
-use anyhow::Result;
-use async_trait::async_trait;
+use crate::{ProxyRequest, TcpInner, TcpSession, handle_proxy_request, router::Router};
 use bytes::{Buf, Bytes, BytesMut};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tracing::{Instrument, error, info, trace_span};
 use url::Url;
 
-pub struct HttpServer {
-    #[allow(dead_code)]
-    bind_addr: SocketAddr,
-    #[allow(dead_code)]
-    users: Vec<AuthUser>,
-    listener: TcpListener,
-}
-
-impl HttpServer {
-    pub async fn new(cfg: HttpServerCfg) -> Result<Self, SError> {
-        let dual_stack = cfg.bind_addr.is_ipv6();
-        let socket = Socket::new(
-            if dual_stack {
-                Domain::IPV6
-            } else {
-                Domain::IPV4
-            },
-            Type::STREAM,
-            Some(Protocol::TCP),
-        )?;
+pub async fn start_http_inbound(
+    tag: String,
+    router: Arc<Router>,
+    cfg: HttpServerCfg,
+) -> Result<(), SError> {
+    let dual_stack = cfg.bind_addr.is_ipv6();
+    let socket = Socket::new(
         if dual_stack {
-            let _ = socket.set_only_v6(false);
-        }
-        socket.set_reuse_address(true)?;
-        socket.set_nonblocking(true)?;
-        socket.bind(&cfg.bind_addr.into())?;
-        socket.listen(256)?;
-        let listener = TcpListener::from_std(socket.into())
-            .map_err(|e| SError::SocksError(format!("failed to create TcpListener: {e}")))?;
-        Ok(Self {
-            bind_addr: cfg.bind_addr,
-            listener,
-            users: cfg.users,
-        })
+            Domain::IPV6
+        } else {
+            Domain::IPV4
+        },
+        Type::STREAM,
+        Some(Protocol::TCP),
+    )?;
+    if dual_stack {
+        let _ = socket.set_only_v6(false);
     }
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&cfg.bind_addr.into())?;
+    socket.listen(256)?;
+    let listener = TcpListener::from_std(socket.into())
+        .map_err(|e| SError::SocksError(format!("failed to create TcpListener: {e}")))?;
+
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((stream, addr)) => {
+                    let span = trace_span!(
+                        "http",
+                        s = addr.to_string(),
+                        d = tracing::field::Empty,
+                        r = tracing::field::Empty,
+                        o = tracing::field::Empty,
+                        t = tracing::field::Empty
+                    );
+                    let router = router.clone();
+                    let tag = tag.clone();
+                    let handle_span = span.clone();
+                    tokio::spawn(
+                        async move {
+                            info!("inbound connection accepted");
+                            let res: Result<(), SError> = async {
+                                let req = parse_http_request(stream).await?;
+                                handle_proxy_request(router, tag, req, handle_span).await;
+                                Ok(())
+                            }
+                            .await;
+                            if let Err(e) = res {
+                                error!("error during handling http inbound connection: {}", e);
+                            }
+                        }
+                        .instrument(span),
+                    );
+                }
+                Err(e) => {
+                    error!("error during accepting http inbound connection: {}", e);
+                }
+            }
+        }
+    });
+
+    Ok(())
 }
 
 pub struct PrefixedTcpStream {
@@ -98,89 +127,113 @@ impl AsyncWrite for PrefixedTcpStream {
 
 impl crate::TcpTrait for PrefixedTcpStream {}
 
-#[async_trait]
-impl Inbound for HttpServer {
-    async fn accept(&mut self) -> Result<ProxyRequest, SError> {
-        let (mut stream, _) = self
-            .listener
-            .accept()
+async fn parse_http_request(mut stream: TcpStream) -> Result<ProxyRequest, SError> {
+    let start_time = std::time::Instant::now();
+
+    let mut buf = BytesMut::with_capacity(1024);
+
+    loop {
+        let n = stream
+            .read_buf(&mut buf)
             .await
             .map_err(|e| SError::SocksError(e.to_string()))?;
-        let start_time = std::time::Instant::now();
+        if n == 0 {
+            return Err(SError::SocksError("Connection closed".to_string()));
+        }
 
-        let mut buf = BytesMut::with_capacity(4096);
+        let first_line_end = match buf.windows(2).position(|w| w == b"\r\n") {
+            Some(i) => i,
+            None => {
+                if buf.len() >= 65536 {
+                    return Err(SError::SocksError("Header too large".to_string()));
+                }
+                continue;
+            }
+        };
 
-        loop {
-            let n = stream
-                .read_buf(&mut buf)
-                .await
-                .map_err(|e| SError::SocksError(e.to_string()))?;
-            if n == 0 {
-                return Err(SError::SocksError("Connection closed".to_string()));
+        let first_line_bytes = &buf[..first_line_end];
+        let first_line = match std::str::from_utf8(first_line_bytes) {
+            Ok(s) => s,
+            Err(_) => {
+                return Err(SError::SocksError(
+                    "Invalid UTF-8 in request line".to_string(),
+                ));
+            }
+        };
+
+        let mut parts = first_line.split_whitespace();
+        let method = parts
+            .next()
+            .ok_or(SError::SocksError("No method".to_string()))?;
+        let path = parts
+            .next()
+            .ok_or(SError::SocksError("No path".to_string()))?;
+
+        if method == "CONNECT" {
+            if let Some(headers_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let dst = parse_host_port(path)?;
+                stream
+                    .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    .await
+                    .map_err(|e| SError::SocksError(e.to_string()))?;
+
+                let offset = headers_end + 4;
+                let remaining = buf.split_off(offset);
+                let prefix = if remaining.is_empty() {
+                    None
+                } else {
+                    Some(remaining.freeze())
+                };
+
+                let prefixed_stream = PrefixedTcpStream { stream, prefix };
+
+                return Ok(ProxyRequest::Tcp(TcpSession {
+                    inner: TcpInner {
+                        stream: Box::new(prefixed_stream),
+                    },
+                    dst,
+                    start_time,
+                }));
+            } else {
+                if buf.len() >= 65536 {
+                    return Err(SError::SocksError("Header too large".to_string()));
+                }
+                continue;
+            }
+        } else {
+            if let Some(dst) = parse_url_simple(path) {
+                let prefix = Some(buf.freeze());
+                let prefixed_stream = PrefixedTcpStream { stream, prefix };
+                return Ok(ProxyRequest::Tcp(TcpSession {
+                    inner: TcpInner {
+                        stream: Box::new(prefixed_stream),
+                    },
+                    dst,
+                    start_time,
+                }));
             }
 
-            let mut headers = [httparse::EMPTY_HEADER; 64];
-            let parse_result = {
-                let mut req = httparse::Request::new(&mut headers);
-                match req.parse(&buf) {
-                    Ok(httparse::Status::Complete(offset)) => {
-                        let method = req
-                            .method
-                            .ok_or(SError::SocksError("No method".to_string()))?;
-                        let path = req.path.ok_or(SError::SocksError("No path".to_string()))?;
-
-                        let is_connect = method == "CONNECT";
-                        let dst = if is_connect {
-                            parse_host_port(path)?
-                        } else {
-                            parse_url(path, req.headers)?
-                        };
-                        Ok(Some((offset, dst, is_connect)))
-                    }
-                    Ok(httparse::Status::Partial) => Ok(None),
-                    Err(e) => Err(SError::SocksError(format!("Http parse error: {}", e))),
-                }
-            };
-
-            match parse_result {
-                Ok(Some((offset, dst, is_connect))) => {
-                    if is_connect {
-                        stream
-                            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                            .await
-                            .map_err(|e| SError::SocksError(e.to_string()))?;
-                    }
-
-                    let remaining = buf.split_off(offset);
-
-                    let prefix = if is_connect {
-                        if remaining.is_empty() {
-                            None
-                        } else {
-                            Some(remaining.freeze())
-                        }
-                    } else {
-                        let mut full = buf;
-                        full.unsplit(remaining);
-                        Some(full.freeze())
-                    };
-
-                    let prefixed_stream = PrefixedTcpStream { stream, prefix };
-
-                    return Ok(ProxyRequest::Tcp(TcpSession {
-                        inner: TcpInner { stream: Box::new(prefixed_stream) },
-                        dst,
-                        start_time,
-                    }));
-                }
-                Ok(None) => {
-                    if buf.len() >= 65536 {
-                        return Err(SError::SocksError("Header too large".to_string()));
-                    }
-                    continue;
-                }
-                Err(e) => return Err(e),
+            let headers_part = &buf[first_line_end + 2..];
+            if let Some(dst) = find_host(headers_part) {
+                let prefix = Some(buf.freeze());
+                let prefixed_stream = PrefixedTcpStream { stream, prefix };
+                return Ok(ProxyRequest::Tcp(TcpSession {
+                    inner: TcpInner {
+                        stream: Box::new(prefixed_stream),
+                    },
+                    dst,
+                    start_time,
+                }));
             }
+
+            if buf.windows(4).position(|w| w == b"\r\n\r\n").is_some() {
+                return Err(SError::SocksError("No Host header found".to_string()));
+            }
+
+            if buf.len() >= 65536 {
+                return Err(SError::SocksError("Header too large".to_string()));
+            }
+            continue;
         }
     }
 }
@@ -207,46 +260,72 @@ fn parse_host_port(path: &str) -> Result<SocksAddr, SError> {
         .host_str()
         .ok_or_else(|| SError::SocksError("Missing host".to_string()))?
         .to_string();
-    let port = url
-        .port_or_known_default()
-        .unwrap_or(443);
+    let port = url.port_or_known_default().unwrap_or(443);
     Ok(SocksAddr::from_domain(host, port))
 }
 
-fn parse_url(path: &str, headers: &[httparse::Header]) -> Result<SocksAddr, SError> {
+fn parse_url_simple(path: &str) -> Option<SocksAddr> {
     if path.starts_with("http://") || path.starts_with("https://") {
-        let url = Url::parse(path)
-            .map_err(|e| SError::SocksError(format!("Http parse error: {}", e)))?;
-        let host = url
-            .host_str()
-            .ok_or_else(|| SError::SocksError("Missing host".to_string()))?
-            .to_string();
-        let port = url
-            .port_or_known_default()
-            .ok_or_else(|| SError::SocksError("Missing port".to_string()))?;
-        return Ok(SocksAddr::from_domain(host, port));
+        if let Ok(url) = Url::parse(path) {
+            if let Some(host) = url.host_str() {
+                let port = url.port_or_known_default().unwrap_or(80);
+                if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+                    let addr = SocketAddr::new(ip, port);
+                    return Some(SocksAddr::from(addr));
+                }
+                return Some(SocksAddr::from_domain(host.to_string(), port));
+            }
+        }
     }
+    None
+}
 
-    for header in headers {
-        if header.name.eq_ignore_ascii_case("Host") {
-            let host_raw = std::str::from_utf8(header.value)
-                .map_err(|_| SError::SocksError("Invalid Host header".to_string()))?
-                .trim();
-            // Build an http URL to leverage known default port (80)
-            let url = Url::parse(&format!("http://{}/", host_raw))
-                .map_err(|_| SError::SocksError("Invalid Host header".to_string()))?;
-            let host = url
-                .host_str()
-                .ok_or_else(|| SError::SocksError("Missing host".to_string()))?
-                .to_string();
-            let port = url
-                .port_or_known_default()
-                .unwrap_or(80);
-            return Ok(SocksAddr::from_domain(host, port));
+fn find_host(buf: &[u8]) -> Option<SocksAddr> {
+    let s = std::str::from_utf8(buf).ok()?;
+
+    for line in s.split('\n') {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.len() > 5 && line[..5].eq_ignore_ascii_case("host:") {
+            let host_raw = line[5..].trim();
+            let url = Url::parse(&format!("http://{}/", host_raw)).ok()?;
+            let host = url.host_str()?.to_string();
+            let port = url.port_or_known_default().unwrap_or(80);
+            if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+                let addr = SocketAddr::new(ip, port);
+                return Some(SocksAddr::from(addr));
+            }
+            return Some(SocksAddr::from_domain(host, port));
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::msgs::socks5::AddrOrDomain;
+
+    #[test]
+    fn parse_url_simple_ip_host_uses_ip_addr() {
+        let dst = parse_url_simple("http://33.22.22.1").expect("expected dst");
+        assert_eq!(dst.port, 80);
+        match dst.addr {
+            AddrOrDomain::V4(_) => {}
+            _ => panic!("expected IPv4 address variant for IP host"),
         }
     }
 
-    Err(SError::SocksError(
-        "Could not determine destination".to_string(),
-    ))
+    #[test]
+    fn find_host_ip_uses_ip_addr() {
+        let req = b"GET / HTTP/1.1\r\nHost: 33.22.22.1:8080\r\n\r\n";
+        let dst = find_host(req).expect("expected dst");
+        assert_eq!(dst.port, 8080);
+        match dst.addr {
+            AddrOrDomain::V4(_) => {}
+            _ => panic!("expected IPv4 address variant for IP host header"),
+        }
+    }
 }

@@ -6,25 +6,24 @@ use std::{pin::Pin, sync::Arc};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     select,
-    sync::mpsc::{Receiver, Sender, channel},
+    sync::mpsc::{channel, Receiver, Sender},
 };
-use tracing::{Instrument, Level, error, event, info, trace, trace_span};
+use tracing::{error, event, info, trace, trace_span, Instrument, Level, warn};
 
 use crate::{
-    Inbound, ProxyRequest, TcpInner, TcpSession, TcpTrait, UdpInner, UdpSession,
     config::ShadowQuicServerCfg,
     error::SError,
+    handle_proxy_request,
     msgs::{
         shadowquic::{SQCmd, SQReq},
         socks5::{SDecode, SocksAddr},
     },
-    quic::QuicConnection,
+    quic::{EndServer, QuicConnection, QuicErrorRepr, QuicServer},
+    router::Router,
+    Inbound, ProxyRequest, TcpInner, TcpSession, TcpTrait, UdpInner, UdpSession,
 };
 
-use super::{IDStore, SQConn, handle_udp_packet_recv, handle_udp_recv_ctrl, handle_udp_send};
-
-use crate::quic::EndServer;
-use crate::quic::QuicServer;
+use super::{handle_udp_packet_recv, handle_udp_recv_ctrl, handle_udp_send, IDStore, SQConn};
 pub struct ShadowQuicServer {
     pub config: ShadowQuicServerCfg,
     request_sender: Sender<ProxyRequest>,
@@ -62,6 +61,35 @@ impl ShadowQuicServer {
 
         Ok(())
     }
+}
+
+pub async fn start_shadowquic_inbound(
+    tag: String,
+    router: Arc<Router>,
+    cfg: ShadowQuicServerCfg,
+) -> Result<(), SError> {
+    let mut server = ShadowQuicServer::new(cfg)?;
+    server.init().await?;
+
+    tokio::spawn(async move {
+        loop {
+            let req = match server.accept().await {
+                Ok(r) => r,
+                Err(e) => {
+                    error!("shadowquic inbound accept error: {}", e);
+                    break;
+                }
+            };
+            let router = router.clone();
+            let tag = tag.clone();
+            tokio::spawn(async move {
+                let span = trace_span!("shadowquic", tag = tag.as_str());
+                handle_proxy_request(router, tag, req, span).await;
+            });
+        }
+    });
+
+    Ok(())
 }
 
 #[async_trait]
@@ -116,6 +144,15 @@ impl Inbound for ShadowQuicServer {
                             });
                         }
                         Err(e) => {
+                            if let QuicErrorRepr::QuicConnection(conn_err) = &e {
+                                if matches!(conn_err, quinn::ConnectionError::LocallyClosed) {
+                                    warn!(
+                                        "quic endpoint {} closed, stop accepting new connections",
+                                        cfg.bind_addr
+                                    );
+                                    break;
+                                }
+                            }
                             error!("Error accepting quic connection: {}", e);
                         }
                     }

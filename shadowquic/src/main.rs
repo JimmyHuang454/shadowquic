@@ -26,20 +26,13 @@ async fn main() {
     let content = std::fs::read_to_string(cli.config).expect("can't open config yaml file");
     let cfg: Config = serde_yaml::from_str(&content).expect("invalid yaml file content");
     setup_log(cfg.log_level.clone());
-    let manager = cfg
-        .build_manager()
-        .await
-        .expect("creating inbound/outbound failed");
 
     info!("shadowquic {} running", env!("CARGO_PKG_VERSION"));
-    tokio::select! {
-        res = manager.run() => {
-            res.expect("shadowquic stopped");
-        }
-        _ = tokio::signal::ctrl_c() => {
-            info!("received ctrl-c, shutting down");
-        }
-    }
+    cfg.run().await.expect("shadowquic init failed");
+    tokio::signal::ctrl_c()
+        .await
+        .expect("failed to listen for ctrl-c");
+    info!("received ctrl-c, shutting down");
 }
 
 fn setup_log(level: LogLevel) {

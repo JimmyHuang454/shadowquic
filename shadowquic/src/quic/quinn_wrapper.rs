@@ -24,6 +24,7 @@ use crate::{
     error::SResult,
     quic::{QuicClient, QuicConnection, QuicServer},
     shadowquic::{MAX_DATAGRAM_WINDOW, MAX_SEND_WINDOW, MAX_STREAM_WINDOW},
+    utils::format_duration,
 };
 
 pub type Connection = quinn::Connection;
@@ -49,9 +50,9 @@ impl QuicConnection for Connection {
         let rate: f32 =
             (self.stats().path.lost_packets as f32) / ((self.stats().path.sent_packets + 1) as f32);
         info!(
-            "packet_loss_rate:{:.2}%, rtt:{:?}, mtu:{}",
+            "packet_loss_rate:{:.2}%, rtt:{}, mtu:{}",
             rate * 100.0,
-            self.rtt(),
+            format_duration(self.rtt()),
             self.stats().path.current_mtu,
         );
         let (send, recv) = self.open_bi().await?;
@@ -66,9 +67,9 @@ impl QuicConnection for Connection {
         let rate: f32 =
             (self.stats().path.lost_packets as f32) / ((self.stats().path.sent_packets + 1) as f32);
         info!(
-            "packet_loss_rate:{:.2}%, rtt:{:?}, mtu:{}",
+            "packet_loss_rate:{:.2}%, rtt:{}, mtu:{}",
             rate * 100.0,
-            self.rtt(),
+            format_duration(self.rtt()),
             self.stats().path.current_mtu,
         );
 
@@ -420,7 +421,9 @@ impl QuicServer for Endpoint {
                 Ok(connection)
             }
             None => {
-                panic!("Quic endpoint closed");
+                return Err(QuicErrorRepr::QuicConnection(
+                    quinn::ConnectionError::LocallyClosed,
+                ));
             }
         }
     }

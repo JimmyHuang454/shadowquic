@@ -32,13 +32,15 @@ use crate::{
 use super::{IDStore, SQConn, handle_udp_packet_recv, inbound::Unsplit};
 
 pub struct ShadowQuicClient<EndT: QuicClient = EndClient> {
+    pub tag: String,
     pub quic_conn: Option<SQConn<EndT::C>>,
     pub config: ShadowQuicClientCfg,
     pub quic_end: OnceCell<EndT>,
 }
 impl<End: QuicClient> ShadowQuicClient<End> {
-    pub fn new(cfg: ShadowQuicClientCfg) -> Self {
+    pub fn new(tag: String, cfg: ShadowQuicClientCfg) -> Self {
         Self {
+            tag,
             quic_conn: None,
             quic_end: OnceCell::new(),
             config: cfg,
@@ -47,8 +49,9 @@ impl<End: QuicClient> ShadowQuicClient<End> {
     pub async fn init_endpoint(&self, ipv6: bool) -> Result<End, SError> {
         End::new(&self.config, ipv6).await
     }
-    pub fn new_with_socket(cfg: ShadowQuicClientCfg, socket: UdpSocket) -> Result<Self, SError> {
+    pub fn new_with_socket(tag: String, cfg: ShadowQuicClientCfg, socket: UdpSocket) -> Result<Self, SError> {
         Ok(Self {
+            tag,
             quic_end: OnceCell::from(End::new_with_socket(&cfg, socket)?),
             quic_conn: None,
             config: cfg,
@@ -121,6 +124,9 @@ impl<End: QuicClient> ShadowQuicClient<End> {
 }
 #[async_trait]
 impl Outbound for ShadowQuicClient {
+    fn tag(&self) -> &str {
+        &self.tag
+    }
     async fn handle(&mut self, req: crate::ProxyRequest) -> Result<tokio::sync::oneshot::Receiver<(u64, u64)>, crate::error::SError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.prepare_conn().await?;
@@ -134,7 +140,7 @@ impl Outbound for ShadowQuicClient {
             let res = async {
                 match req {
                     crate::ProxyRequest::Tcp(mut tcp_session) => {
-                        debug!("bistream opened for tcp dst:{}", tcp_session.dst.clone());
+                        debug!("bistream opened for tcp {}", tcp_session.dst.clone());
                         //let _enter = _span.enter();
                         let req = SQReq {
                             cmd: SQCmd::Connect,

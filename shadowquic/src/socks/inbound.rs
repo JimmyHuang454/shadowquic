@@ -10,13 +10,15 @@ use crate::msgs::socks5::{
     SOCKS5_CMD_UDP_ASSOCIATE, SOCKS5_REPLY_SUCCEEDED, SOCKS5_VERSION,
 };
 use crate::utils::dual_socket::to_ipv4_mapped;
-use crate::{Inbound, ProxyRequest, TcpInner, TcpSession, UdpInner, UdpSession};
-use async_trait::async_trait;
+use crate::{
+    ProxyRequest, TcpInner, TcpSession, UdpInner, UdpSession, handle_proxy_request,
+    router::Router,
+};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 use anyhow::Result;
-use tracing::{Instrument, trace, trace_span};
+use tracing::{error, Instrument, trace, trace_span};
 
 use super::UdpSocksWrap;
 
@@ -156,40 +158,71 @@ impl SocksServer {
     }
 }
 
-#[async_trait]
-impl Inbound for SocksServer {
-    async fn accept(&mut self) -> Result<ProxyRequest, SError> {
-        let (stream, addr) = self.listener.accept().await?;
-        let start_time = std::time::Instant::now();
-        let span = trace_span!("socks", src = addr.to_string());
-        // ipv4 may be mapped for dual stack socket
-        let local_addr = to_ipv4_mapped(stream.local_addr().unwrap());
-
-        let (s, req, socket) = self
-            .handle_socks(stream, local_addr)
-            .instrument(span)
-            .await?;
-        match req.cmd {
-            SOCKS5_CMD_TCP_CONNECT => Ok(ProxyRequest::Tcp(TcpSession {
-                inner: TcpInner { stream: Box::new(s) },
-                dst: req.dst,
-                start_time,
-            })),
-            SOCKS5_CMD_UDP_ASSOCIATE => {
-                let socket = Arc::new(socket.unwrap());
-                Ok(ProxyRequest::Udp(UdpSession {
-                    inner: UdpInner {
-                        send: Arc::new(UdpSocksWrap(socket.clone(), Default::default())),
-                        recv: Box::new(UdpSocksWrap(socket, Default::default())),
-                        stream: Some(Box::new(s)),
-                    },
-                    dst: req.dst,
-                    start_time,
-                }))
+impl SocksServer {
+    pub fn run(self, tag: String, router: Arc<Router>) {
+        tokio::spawn(async move {
+            let server = self;
+            loop {
+                let res: Result<(), SError> = async {
+                    let (stream, addr) = server.listener.accept().await?;
+                    let start_time = std::time::Instant::now();
+                    let span = trace_span!("socks", src = addr.to_string());
+                    let span_clone = span.clone();
+                    let local_addr = to_ipv4_mapped(stream.local_addr().unwrap());
+                    let (s, req, socket) = server
+                        .handle_socks(stream, local_addr)
+                        .instrument(span)
+                        .await?;
+                    let proxy_req: ProxyRequest = match req.cmd {
+                        SOCKS5_CMD_TCP_CONNECT => {
+                            let stream = Box::new(s) as crate::AnyTcp;
+                            ProxyRequest::Tcp(TcpSession {
+                                inner: TcpInner { stream },
+                                dst: req.dst,
+                                start_time,
+                            })
+                        }
+                        SOCKS5_CMD_UDP_ASSOCIATE => {
+                            let socket = Arc::new(socket.unwrap());
+                            let send = Arc::new(UdpSocksWrap(socket.clone(), Default::default())) as crate::AnyUdpSend;
+                            let recv = Box::new(UdpSocksWrap(socket, Default::default())) as crate::AnyUdpRecv;
+                            let stream = Some(Box::new(s) as crate::AnyTcp);
+                            ProxyRequest::Udp(UdpSession {
+                                inner: UdpInner {
+                                    send,
+                                    recv,
+                                    stream,
+                                },
+                                dst: req.dst,
+                                start_time,
+                            })
+                        }
+                        _ => {
+                            return Err(SError::ProtocolViolation);
+                        }
+                    };
+                    let router = router.clone();
+                    let tag = tag.clone();
+                    tokio::spawn(async move {
+                        handle_proxy_request(router, tag, proxy_req, span_clone).await;
+                    });
+                    Ok(())
+                }
+                .await;
+                if let Err(e) = res {
+                    error!("error during handling socks inbound connection: {}", e);
+                }
             }
-            _ => {
-                return Err(SError::ProtocolViolation);
-            }
-        }
+        });
     }
+}
+
+pub async fn start_socks_inbound(
+    tag: String,
+    router: Arc<Router>,
+    cfg: SocksServerCfg,
+) -> Result<(), SError> {
+    let server = SocksServer::new(cfg).await?;
+    server.run(tag, router);
+    Ok(())
 }

@@ -6,47 +6,43 @@ use tracing::{Instrument, error, trace, trace_span};
 
 use crate::{
     Outbound, UdpSession,
-    config::DirectOutCfg,
+    config::{DirectOutCfg, DnsCfg},
     error::SError,
     utils::{self, bidirectional_copy, dual_socket::DualSocket},
 };
 use async_trait::async_trait;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct DirectOut {
+    pub tag: String,
     pub cfg: DirectOutCfg,
+    pub dns_cfg: DnsCfg,
 }
 
 #[async_trait]
 impl Outbound for DirectOut {
+    fn tag(&self) -> &str {
+        &self.tag
+    }
     async fn handle(
         &mut self,
         req: crate::ProxyRequest,
     ) -> Result<tokio::sync::oneshot::Receiver<(u64, u64)>, crate::error::SError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let dns_strategy = self.cfg.dns_strategy.clone();
-        let doh_cfg = self.cfg.dns_over_https.clone();
         let self_clone = self.clone();
         let fut = async move {
             let res = async {
                 match req {
                     crate::ProxyRequest::Tcp(mut tcp_session) => {
+                        let resolve_result =
+                            utils::dns::resolve_socks_addr(&tcp_session.dst, &self_clone.dns_cfg)
+                                .await?;
+                        let dst = resolve_result.addr;
                         trace!(
-                            "direct tcp to {} cost: {:?}",
-                            tcp_session.dst,
-                            tcp_session.start_time.elapsed()
-                        );
-
-                        let dst = utils::dns::resolve_socks_addr(
-                            &tcp_session.dst,
-                            &dns_strategy,
-                            doh_cfg.as_ref(),
-                        )
-                        .await?;
-                        trace!(
-                            "resolved {} to {} cost: {:?}",
+                            "resolved {} to {} (cached: {}) cost: {:?}",
                             tcp_session.dst,
                             dst,
+                            resolve_result.cached,
                             tcp_session.start_time.elapsed()
                         );
                         let mut upstream = TcpStream::connect(dst).await?;
@@ -87,46 +83,38 @@ impl Outbound for DirectOut {
     }
 }
 impl DirectOut {
-    pub fn new(cfg: DirectOutCfg) -> Self {
-        crate::utils::dns::init_dns_from_direct_cfg(&cfg);
-        Self { cfg }
+    pub async fn new(tag: String, cfg: DirectOutCfg, dns_cfg: DnsCfg) -> Self {
+        crate::utils::dns::init_dns_from_direct_cfg(&dns_cfg).await;
+        Self { tag, cfg, dns_cfg }
     }
 
     async fn handle_udp(&self, udp_session: UdpSession) -> Result<(), SError> {
         trace!("associating udp to {}", udp_session.dst);
-        let dst = udp_session
-            .dst
-            .to_socket_addrs()?
-            .next()
-            .ok_or(SError::DomainResolveFailed(udp_session.dst.to_string()))?;
-        trace!("resolved to {}", dst);
-        let ipv4_only = dst.is_ipv4();
 
-        let socket = DualSocket::new_bind(dst, !ipv4_only)?;
-
+        let socket = DualSocket::new_bind_any().await?;
         let upstream = Arc::new(socket);
         let upstream_clone = upstream.clone();
         let mut downstream = udp_session.inner.recv;
 
         let dns_cache = utils::dns::DnsResolve::default();
         let dns_cache_clone = dns_cache.clone();
-        let dns_strategy = self.cfg.dns_strategy.clone();
-        let doh_cfg = self.cfg.dns_over_https.clone();
+        // let dns_strategy = self.dns_cfg.dns_strategy.clone();
+        // let doh_cfg = self.dns_cfg.dns_over_https.clone();
+        let dns_cfg = Arc::new(self.dns_cfg.clone());
+        let sender = udp_session.inner.send;
+
         let fut1 = async move {
+            let mut buf_send = BytesMut::new();
+            buf_send.resize(2000, 0);
             loop {
-                let mut buf_send = BytesMut::new();
-                buf_send.resize(2000, 0);
                 //trace!("recv upstream");
-                let (len, dst) = upstream.recv_from(&mut buf_send).await?;
+                let (len, dst) = upstream.recv_from_buf(&mut buf_send).await?;
                 //trace!("udp request reply from:{}", dst);
                 let dst = dns_cache_clone.inv_resolve(&dst).await;
                 //trace!("udp source inverse resolved to:{}", dst);
-                let buf = buf_send.freeze();
                 //trace!("udp recved:{} bytes", len);
-                let _ = udp_session
-                    .inner
-                    .send
-                    .send_to(buf.slice(..len), dst)
+                let _ = sender
+                    .send_to(buf_send.clone().split_to(len).freeze(), dst)
                     .await?;
             }
             #[allow(unreachable_code)]
@@ -136,10 +124,9 @@ impl DirectOut {
             loop {
                 let (buf, dst) = downstream.recv_from().await?;
 
-                let dst = dns_cache
-                    .resolve(dst, &dns_strategy, doh_cfg.as_ref())
-                    .await?;
-                //trace!("udp resolve to:{}", dst);
+                let resolve_result = dns_cache.resolve(dst, &dns_cfg).await?;
+                let dst = resolve_result.addr;
+                //trace!("udp resolve to:{} (cached: {})", dst, resolve_result.cached);
                 let _siz = upstream_clone.send_to(&buf, &dst).await?;
                 //trace!("udp request sent:{}bytes", siz);
             }

@@ -28,5 +28,5 @@ rules:
     - inbound:
         - socks-in
       outbound: shadowquic-out
-final: "shadowquic-out"
+final-outbound: "shadowquic-out"
 log-level: "trace"

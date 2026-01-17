@@ -15,10 +15,10 @@ inbounds:
 outbounds:
     direct-out:
         type: direct
-        dns-strategy: prefer-ipv4 # or prefer-ipv6, ipv4-only, ipv6-only
+        strategy: prefer-ipv4 # or prefer-ipv6, ipv4-only, ipv6-only
 rules:
     - inbound:
         - sq-in
       outbound: direct-out
-final: "direct-out"
+final-outbound: "direct-out"
 log-level: "trace"

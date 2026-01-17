@@ -11,5 +11,5 @@ outbounds:
         addr: "192.168.7.1:1089"
         # username: "username"
         # password: "password"
-final: socks-out
+final-outbound: socks-out
 log-level: "trace"

@@ -26,6 +26,7 @@ use crate::{
 
 #[derive(Debug, Clone)]
 pub struct SocksClient {
+    pub tag: String,
     pub addr: String,
     pub username: Option<String>,
     pub password: Option<String>,
@@ -34,6 +35,9 @@ pub struct SocksClient {
 
 #[async_trait]
 impl Outbound for SocksClient {
+    fn tag(&self) -> &str {
+        &self.tag
+    }
     async fn handle(
         &mut self,
         req: ProxyRequest,
@@ -70,8 +74,9 @@ impl Outbound for SocksClient {
 }
 
 impl SocksClient {
-    pub fn new(cfg: SocksClientCfg) -> Self {
+    pub fn new(tag: String, cfg: SocksClientCfg) -> Self {
         Self {
+            tag,
             addr: cfg.addr,
             username: cfg.username,
             password: cfg.password,

@@ -1,4 +1,3 @@
-use shadowquic::Manager;
 use shadowquic::config::{
     InboundCfg, InboundType, OutboundCfg, Rule, SocksClientCfg, SocksServerCfg,
 };
@@ -8,6 +7,8 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
+use shadowquic::router::Router;
+use tokio::sync::Mutex;
 
 async fn start_mock_server(addr: &str) -> (String, Arc<Notify>) {
     let listener = TcpListener::bind(addr).await.unwrap();
@@ -99,20 +100,26 @@ async fn test_routing_rules() {
     let rules = vec![
         Rule {
             inbound: Some(vec!["in_2".to_string()]),
-            domain: None,
+            domain: Some(vec!["google.com".to_string()]),
             ip: None,
+            geoip: None,
+            private_ip: false,
             outbound: "out_b".to_string(),
         },
         Rule {
             inbound: None,
             domain: Some(vec!["google.com".to_string()]),
             ip: None,
+            geoip: None,
+            private_ip: false,
             outbound: "out_a".to_string(),
         },
         Rule {
             inbound: None,
             domain: None,
             ip: Some(vec!["1.1.1.1/32".to_string()]),
+            geoip: None,
+            private_ip: false,
             outbound: "out_a".to_string(),
         },
     ];
@@ -154,12 +161,11 @@ async fn test_routing_rules() {
 
     // Create Outbounds
     use shadowquic::socks::outbound::SocksClient;
-    use tokio::sync::Mutex;
 
     let mut outbounds_map: HashMap<String, Arc<Mutex<Box<dyn shadowquic::Outbound>>>> =
         HashMap::new();
 
-    let client_a = SocksClient::new(SocksClientCfg {
+    let client_a = SocksClient::new("out_a".to_string(), SocksClientCfg {
         addr: addr_a.clone(),
         username: None,
         password: None,
@@ -170,7 +176,7 @@ async fn test_routing_rules() {
         Arc::new(Mutex::new(Box::new(client_a))),
     );
 
-    let client_b = SocksClient::new(SocksClientCfg {
+    let client_b = SocksClient::new("out_b".to_string(), SocksClientCfg {
         addr: addr_b.clone(),
         username: None,
         password: None,
@@ -182,22 +188,15 @@ async fn test_routing_rules() {
     );
 
     // Create Router
-    use shadowquic::router::Router;
 
-    let router = Router::new(rules, outbounds_map, Some("out_b".to_string()), true).unwrap();
+    let router = Router::new(rules, outbounds_map, Some("out_b".to_string()), true, None).unwrap();
+    let router = Arc::new(router);
 
-    let manager = Manager {
-        inbounds: vec![
-            ("in_1".to_string(), Box::new(server1)),
-            ("in_2".to_string(), Box::new(server2)),
-        ],
-        router: Arc::new(router),
-    };
+    let r1 = router.clone();
+    server1.run("in_1".to_string(), r1);
 
-    // Run Manager in background
-    tokio::spawn(async move {
-        manager.run().await.unwrap();
-    });
+    let r2 = router.clone();
+    server2.run("in_2".to_string(), r2);
 
     // Helper to connect and request
     async fn request(proxy_addr: SocketAddr, target: &str, port: u16) {
@@ -227,6 +226,8 @@ async fn test_routing_rules() {
         // Read response (we don't care about content, just that it connected and router forwarded it)
         // The mock outbound server will accept and complete handshake.
         // We wait a bit to ensure the notification happens.
+        let mut buf = [0u8; 10];
+        let _ = stream.read(&mut buf).await;
     }
 
     let timeout = std::time::Duration::from_secs(10);
@@ -271,4 +272,23 @@ async fn test_routing_rules() {
     .await
     .expect("case 4 timeout");
     println!("Case 4 passed: in_2 -> google.com -> out_b (inbound rule priority)");
+}
+
+#[tokio::test]
+async fn test_geoip_validation() {
+    let rules = vec![Rule {
+        inbound: None,
+        domain: None,
+        ip: None,
+        geoip: Some(vec!["cn".to_string()]),
+        private_ip: false,
+        outbound: "out_a".to_string(),
+    }];
+    let outbounds_map: HashMap<String, Arc<Mutex<Box<dyn shadowquic::Outbound>>>> = HashMap::new();
+    let result = Router::new(rules, outbounds_map, Some("out_b".to_string()), true, None);
+    assert!(result.is_err());
+    assert_eq!(
+        result.err().unwrap().to_string(),
+        "GeoIP rule present but mmdb not configured"
+    );
 }

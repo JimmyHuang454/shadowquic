@@ -9,7 +9,7 @@ use tokio::net::TcpStream;
 use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::mpsc::{Receiver, Sender};
-use tracing::{error, trace};
+use tracing::{Span, error, field, info, trace, Instrument};
 
 pub mod config;
 pub mod direct;
@@ -78,6 +78,7 @@ pub trait Outbound<T = AnyTcp, I = AnyUdpRecv, O = AnyUdpSend>: Send + Sync + Un
         &mut self,
         req: ProxyRequest<T, I, O>,
     ) -> Result<tokio::sync::oneshot::Receiver<(u64, u64)>, SError>;
+    fn tag(&self) -> &str;
 }
 
 #[async_trait]
@@ -108,7 +109,11 @@ pub struct SessionObserver {
 
 impl SessionObserver {
     pub fn new(stats: Option<Arc<OutboundStats>>, dst: SocksAddr, start_time: Instant) -> Self {
-        Self { stats, dst, start_time }
+        Self {
+            stats,
+            dst,
+            start_time,
+        }
     }
 
     pub fn on_start(&self) {
@@ -176,60 +181,49 @@ impl SessionObserver {
             (None, Err(_)) => {}
         }
     }
+
+    pub fn spawn_observe(self, rx: tokio::sync::oneshot::Receiver<(u64, u64)>, span: Span) {
+        tokio::spawn(
+            async move {
+                self.observe(rx).await;
+            }
+            .instrument(span),
+        );
+    }
 }
 
-pub struct Manager {
-    pub inbounds: Vec<(String, Box<dyn Inbound>)>,
-    pub router: Arc<Router>,
-}
+pub async fn handle_proxy_request(
+    router: Arc<Router>,
+    inbound_tag: String,
+    req: ProxyRequest,
+    span: Span,
+) {
+    let (outbound, stats, rule_index) = router.route(&inbound_tag, &req);
+    let mut out = outbound.lock().await;
+    let (dst, start_time) = match &req {
+        ProxyRequest::Tcp(s) => (s.dst.clone(), s.start_time),
+        ProxyRequest::Udp(s) => (s.dst.clone(), s.start_time),
+    };
+    span.record("d", &field::display(&dst));
+    span.record(
+        "r",
+        &field::debug(&match rule_index {
+            Some(idx) => idx.to_string(),
+            None => "default".to_string(),
+        }),
+    );
+    span.record("o", &field::debug(&out.tag()));
+    span.record("t", &field::debug(&format_duration(start_time.elapsed())));
+    let observer = SessionObserver::new(stats.clone(), dst.clone(), start_time);
+    observer.on_start();
 
-impl Manager {
-    pub async fn run(self) -> Result<(), SError> {
-        let mut tasks = Vec::new();
-        for (tag, i) in self.inbounds {
-            let router = self.router.clone();
-            tasks.push(tokio::spawn(async move {
-                if let Err(e) = i.init().await {
-                    error!("error during init inbound {}: {}", tag, e);
-                    return;
-                }
-                let mut inbound = i;
-                loop {
-                    match inbound.accept().await {
-                        Ok(req) => {
-                            let (outbound, stats) = router.route(&tag, &req);
-                            let mut out = outbound.lock().await;
-                            let (dst, start_time) = match &req {
-                                ProxyRequest::Tcp(s) => (s.dst.clone(), s.start_time),
-                                ProxyRequest::Udp(s) => (s.dst.clone(), s.start_time),
-                            };
-                            let observer = SessionObserver::new(stats, dst, start_time);
-                            observer.on_start();
-                            match out.handle(req).await {
-                                Ok(rx) => {
-                                    tokio::spawn(async move {
-                                        observer.observe(rx).await;
-                                    });
-                                }
-                                Err(e) => {
-                                    observer.on_handle_error();
-                                    error!("error during handling request: {}", e)
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            error!("error during accepting request: {}", e)
-                        }
-                    }
-                }
-            }));
+    match out.handle(req).await {
+        Ok(rx) => {
+            observer.spawn_observe(rx, span.clone());
         }
-
-        for task in tasks {
-            let _ = task.await;
+        Err(e) => {
+            observer.on_handle_error();
+            error!(parent: &span, "error during handling request: {}", e);
         }
-
-        #[allow(unreachable_code)]
-        Ok(())
     }
 }

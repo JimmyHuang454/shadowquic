@@ -1,20 +1,23 @@
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use tokio::sync::mpsc::{Receiver, Sender, channel};
-use tracing::{error, info, warn};
+use tokio::sync::mpsc::{Sender, channel};
+use tracing::{error, info, warn, trace_span};
 use tun_rs::DeviceBuilder;
 
 use crate::{
-    AnyUdpRecv, AnyUdpSend, Inbound, ProxyRequest, UdpInner, UdpSend, UdpSession,
+    AnyUdpRecv, AnyUdpSend, ProxyRequest, UdpInner, UdpSend, UdpSession,
     config::TunInboundCfg,
     error::SError,
+    handle_proxy_request,
     msgs::socks5::{AddrOrDomain, SocksAddr},
+    router::Router,
     utils::route::RouteManager,
 };
 
@@ -87,174 +90,153 @@ impl UdpSend for TunFlowSend {
     }
 }
 
-pub struct TunInbound {
+pub fn start_tun_inbound(
+    tag: String,
+    router: Arc<Router>,
     cfg: TunInboundCfg,
-    request_sender: Sender<ProxyRequest>,
-    request: Receiver<ProxyRequest>,
-}
+) -> Result<(), SError> {
+    if cfg.ipv4_cidr.is_none() && cfg.ipv6_cidr.is_none() {
+        return Err(SError::SocksError("tun inbound requires ipv4 or ipv6".into()));
+    }
 
-impl TunInbound {
-    pub fn new(cfg: TunInboundCfg) -> Result<Self, SError> {
-        if cfg.ipv4_cidr.is_none() && cfg.ipv6_cidr.is_none() {
-            return Err(SError::SocksError(
-                "tun inbound requires ipv4 or ipv6".into(),
-            ));
+    tokio::spawn(async move {
+        let mut builder = DeviceBuilder::new();
+        if let Some(name) = &cfg.name {
+            builder = builder.name(name);
         }
-        let (send, recv) = channel::<ProxyRequest>(64);
-        Ok(Self {
-            cfg,
-            request_sender: send,
-            request: recv,
-        })
-    }
-}
+        if let Some(mtu) = cfg.mtu {
+            builder = builder.mtu(mtu);
+        }
+        if let Some(ipv4) = cfg.ipv4_cidr.as_deref() {
+            match ipv4.parse::<ipnet::IpNet>() {
+                Ok(ipnet::IpNet::V4(v4)) => {
+                    builder = builder.ipv4(v4.addr().to_string(), v4.prefix_len(), None);
+                }
+                Ok(_) => warn!("tun ipv4-cidr is not ipv4"),
+                Err(e) => warn!("tun ipv4-cidr parse failed: {}", e),
+            }
+        }
+        if let Some(ipv6) = cfg.ipv6_cidr.as_deref() {
+            match ipv6.parse::<ipnet::IpNet>() {
+                Ok(ipnet::IpNet::V6(v6)) => {
+                    builder = builder.ipv6(v6.addr().to_string(), v6.prefix_len());
+                }
+                Ok(_) => warn!("tun ipv6-cidr is not ipv6"),
+                Err(e) => warn!("tun ipv6-cidr parse failed: {}", e),
+            }
+        }
 
-#[async_trait]
-impl Inbound for TunInbound {
-    async fn accept(&mut self) -> Result<ProxyRequest, SError> {
-        self.request.recv().await.ok_or(SError::InboundUnavailable)
-    }
+        let dev = match builder.build_async() {
+            Ok(d) => d,
+            Err(e) => {
+                error!("tun build failed: {}", e);
+                return;
+            }
+        };
 
-    async fn init(&self) -> Result<(), SError> {
-        let cfg = self.cfg.clone();
-        let req_tx = self.request_sender.clone();
-
-        tokio::spawn(async move {
-            let mut builder = DeviceBuilder::new();
+        let mut _route_manager = None;
+        if cfg.auto_route == Some(true) {
             if let Some(name) = &cfg.name {
-                builder = builder.name(name);
+                info!("enabling auto route for interface: {}", name);
+                _route_manager = Some(RouteManager::new(
+                    name.clone(),
+                    cfg.ipv4_cidr.is_some(),
+                    cfg.ipv6_cidr.is_some(),
+                ));
+            } else {
+                error!("auto_route enabled but tun name is not set");
             }
-            if let Some(mtu) = cfg.mtu {
-                builder = builder.mtu(mtu);
-            }
-            if let Some(ipv4) = cfg.ipv4_cidr.as_deref() {
-                match ipv4.parse::<ipnet::IpNet>() {
-                    Ok(ipnet::IpNet::V4(v4)) => {
-                        builder = builder.ipv4(v4.addr().to_string(), v4.prefix_len(), None);
-                    }
-                    Ok(_) => warn!("tun ipv4-cidr is not ipv4"),
-                    Err(e) => warn!("tun ipv4-cidr parse failed: {}", e),
+        }
+
+        let (write_tx, mut write_rx) = channel::<Vec<u8>>(1024);
+
+        let flow_timeout = Duration::from_secs(cfg.flow_timeout_secs.unwrap_or(120));
+        let mut flows: HashMap<FlowKey, FlowState> = HashMap::new();
+        let mut buf = vec![0u8; 65536];
+        let mut cleanup_interval = tokio::time::interval(Duration::from_secs(30));
+
+        info!("tun inbound started");
+
+        loop {
+            tokio::select! {
+                _ = cleanup_interval.tick() => {
+                    let now = Instant::now();
+                    flows.retain(|_, st| now.duration_since(st.last_seen) < flow_timeout);
                 }
-            }
-            if let Some(ipv6) = cfg.ipv6_cidr.as_deref() {
-                match ipv6.parse::<ipnet::IpNet>() {
-                    Ok(ipnet::IpNet::V6(v6)) => {
-                        builder = builder.ipv6(v6.addr().to_string(), v6.prefix_len());
+                maybe_pkt = write_rx.recv() => {
+                    let Some(pkt) = maybe_pkt else { break };
+                    if let Err(e) = dev.send(&pkt).await {
+                        error!("tun send failed: {}", e);
                     }
-                    Ok(_) => warn!("tun ipv6-cidr is not ipv6"),
-                    Err(e) => warn!("tun ipv6-cidr parse failed: {}", e),
                 }
-            }
-
-            let dev = match builder.build_async() {
-                Ok(d) => d,
-                Err(e) => {
-                    error!("tun build failed: {}", e);
-                    return;
-                }
-            };
-
-            let mut _route_manager = None;
-            if cfg.auto_route == Some(true) {
-                if let Some(name) = &cfg.name {
-                    info!("enabling auto route for interface: {}", name);
-                    _route_manager = Some(RouteManager::new(
-                        name.clone(),
-                        cfg.ipv4_cidr.is_some(),
-                        cfg.ipv6_cidr.is_some(),
-                    ));
-                } else {
-                    error!("auto_route enabled but tun name is not set");
-                }
-            }
-
-            let (write_tx, mut write_rx) = channel::<Vec<u8>>(1024);
-
-            let flow_timeout = Duration::from_secs(cfg.flow_timeout_secs.unwrap_or(120));
-            let mut flows: HashMap<FlowKey, FlowState> = HashMap::new();
-            let mut buf = vec![0u8; 65536];
-            let mut cleanup_interval = tokio::time::interval(Duration::from_secs(30));
-
-            info!("tun inbound started");
-
-            loop {
-                tokio::select! {
-                    _ = cleanup_interval.tick() => {
-                        let now = Instant::now();
-                        flows.retain(|_, st| now.duration_since(st.last_seen) < flow_timeout);
-                    }
-                    maybe_pkt = write_rx.recv() => {
-                        let Some(pkt) = maybe_pkt else { break };
-                        if let Err(e) = dev.send(&pkt).await {
-                            error!("tun send failed: {}", e);
-                        }
-                    }
-                    r = dev.recv(&mut buf) => {
-                        let len = match r {
-                            Ok(n) => n,
-                            Err(e) => {
-                                error!("tun recv failed: {}", e);
-                                continue;
-                            }
-                        };
-                        let pkt = &buf[..len];
-                        let Some(parsed) = parse_udp_ip_packet(pkt) else {
+                r = dev.recv(&mut buf) => {
+                    let len = match r {
+                        Ok(n) => n,
+                        Err(e) => {
+                            error!("tun recv failed: {}", e);
                             continue;
+                        }
+                    };
+                    let pkt = &buf[..len];
+                    let Some(parsed) = parse_udp_ip_packet(pkt) else {
+                        continue;
+                    };
+
+                    let key = FlowKey {
+                        src: parsed.src_ip,
+                        src_port: parsed.src_port,
+                        dst: parsed.dst_ip,
+                        dst_port: parsed.dst_port,
+                    };
+
+                    let now = Instant::now();
+
+                    let dst_sock: SocksAddr = SocketAddr::new(parsed.dst_ip, parsed.dst_port).into();
+
+                    if !flows.contains_key(&key) {
+                        let (down_tx, down_rx) = channel::<(Bytes, SocksAddr)>(1024);
+                        let send = TunFlowSend {
+                            write_tx: write_tx.clone(),
+                            local_ip: parsed.src_ip,
+                            local_port: parsed.src_port,
+                            remote_ip: parsed.dst_ip,
                         };
 
-                        let key = FlowKey {
-                            src: parsed.src_ip,
-                            src_port: parsed.src_port,
-                            dst: parsed.dst_ip,
-                            dst_port: parsed.dst_port,
+                        let bind_dst: SocksAddr = match parsed.dst_ip {
+                            IpAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0).into(),
+                            IpAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0).into(),
                         };
 
-                        let now = Instant::now();
+                        let session = UdpSession {
+                            inner: UdpInner {
+                                recv: Box::new(down_rx) as AnyUdpRecv,
+                                send: std::sync::Arc::new(send) as AnyUdpSend,
+                                stream: None,
+                            },
+                            dst: bind_dst,
+                            start_time: now,
+                        };
 
-                        let dst_sock: SocksAddr = SocketAddr::new(parsed.dst_ip, parsed.dst_port).into();
+                        let router = router.clone();
+                        let tag = tag.clone();
+                        tokio::spawn(async move {
+                            let span = trace_span!("tun");
+                            handle_proxy_request(router, tag, ProxyRequest::Udp(session), span).await;
+                        });
 
-                        if !flows.contains_key(&key) {
-                            let (down_tx, down_rx) = channel::<(Bytes, SocksAddr)>(1024);
-                            let send = TunFlowSend {
-                                write_tx: write_tx.clone(),
-                                local_ip: parsed.src_ip,
-                                local_port: parsed.src_port,
-                                remote_ip: parsed.dst_ip,
-                            };
+                        flows.insert(key.clone(), FlowState { last_seen: now, downstream: down_tx });
+                    }
 
-                            let bind_dst: SocksAddr = match parsed.dst_ip {
-                                IpAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0).into(),
-                                IpAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0).into(),
-                            };
-
-                            let session = UdpSession {
-                                inner: UdpInner {
-                                    recv: Box::new(down_rx) as AnyUdpRecv,
-                                    send: std::sync::Arc::new(send) as AnyUdpSend,
-                                    stream: None,
-                                },
-                                dst: bind_dst,
-                                start_time: now,
-                            };
-
-                            if let Err(e) = req_tx.send(ProxyRequest::Udp(session)).await {
-                                error!("tun emit udp session failed: {}", e);
-                            } else {
-                                flows.insert(key.clone(), FlowState { last_seen: now, downstream: down_tx });
-                            }
-                        }
-
-                        if let Some(st) = flows.get_mut(&key) {
-                            st.last_seen = now;
-                            let _ = st.downstream.try_send((Bytes::copy_from_slice(parsed.payload), dst_sock));
-                        }
+                    if let Some(st) = flows.get_mut(&key) {
+                        st.last_seen = now;
+                        let _ = st.downstream.try_send((Bytes::copy_from_slice(parsed.payload), dst_sock));
                     }
                 }
             }
-        });
+        }
+    });
 
-        Ok(())
-    }
+    Ok(())
 }
 
 struct ParsedUdp<'a> {

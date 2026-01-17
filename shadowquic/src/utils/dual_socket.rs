@@ -42,6 +42,11 @@ impl DualSocket {
             dual_stack,
         })
     }
+
+    pub async fn new_bind_any() -> io::Result<Self> {
+        Self::new_bind(SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0), true)
+    }
+
     pub async fn send_to(&self, buf: &[u8], addr: &SocketAddr) -> io::Result<usize> {
         let ip = match (self.dual_stack, addr.ip()) {
             (true, IpAddr::V4(ipv4_addr)) => IpAddr::V6(ipv4_addr.to_ipv6_mapped()),
@@ -50,6 +55,18 @@ impl DualSocket {
         self.inner.send_to(buf, (ip, addr.port())).await
     }
     pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        let (len, addr) = self.inner.recv_from(buf).await?;
+        let ip = match (self.dual_stack, addr.ip()) {
+            (true, ip_addr @ IpAddr::V6(ipv6_addr)) => ipv6_addr
+                .to_ipv4_mapped()
+                .map(IpAddr::V4)
+                .unwrap_or(ip_addr),
+            (_, ip) => ip,
+        };
+        Ok((len, SocketAddr::new(ip, addr.port())))
+    }
+
+    pub async fn recv_from_buf(&self, buf: &mut bytes::BytesMut) -> io::Result<(usize, SocketAddr)> {
         let (len, addr) = self.inner.recv_from(buf).await?;
         let ip = match (self.dual_stack, addr.ip()) {
             (true, ip_addr @ IpAddr::V6(ipv6_addr)) => ipv6_addr

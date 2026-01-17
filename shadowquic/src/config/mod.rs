@@ -5,15 +5,15 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::Level;
 
-use crate::router::Router;
 use crate::{
-    Inbound, Manager, Outbound,
+    Outbound,
     direct::outbound::DirectOut,
     error::SError,
-    http::inbound::HttpServer,
-    shadowquic::{inbound::ShadowQuicServer, outbound::ShadowQuicClient},
-    socks::{inbound::SocksServer, outbound::SocksClient},
-    tun::TunInbound,
+    http::inbound::start_http_inbound,
+    router::Router,
+    shadowquic::{inbound::start_shadowquic_inbound, outbound::ShadowQuicClient},
+    socks::{inbound::start_socks_inbound, outbound::SocksClient},
+    tun::start_tun_inbound,
 };
 
 #[cfg(target_os = "android")]
@@ -49,9 +49,8 @@ pub struct Config {
     pub dns: Vec<DnsCfg>,
     #[serde(default)]
     pub rules: Vec<Rule>,
+    #[serde(rename = "final-outbound", alias = "final")]
     pub final_out: Option<String>,
-    #[serde(rename = "final")]
-    pub final_out_legacy: Option<String>,
     #[serde(rename = "select")]
     pub select_legacy: Option<String>,
     #[serde(default)]
@@ -60,9 +59,10 @@ pub struct Config {
     pub stream_buffer_size: Option<usize>,
     #[serde(default = "default_log_outbound_stats")]
     pub log_outbound_stats: bool,
+    pub mmdb: Option<String>,
 }
 impl Config {
-    pub async fn build_manager(self) -> Result<Manager, SError> {
+    pub async fn run(self) -> Result<(), SError> {
         if let Some(size) = self.stream_buffer_size {
             crate::utils::set_bidirectional_copy_buffer_size(size);
         }
@@ -73,34 +73,40 @@ impl Config {
             .collect();
         let mut outbounds = HashMap::new();
         for (tag, cfg) in self.outbounds {
-            let out = cfg.build_outbound(&dns_map).await?;
+            let out = cfg.build_outbound(tag.clone(), &dns_map).await?;
             outbounds.insert(tag, Arc::new(Mutex::new(out)));
-        }
-
-        let mut inbounds = Vec::new();
-        if let Some(inbound) = self.inbound {
-            inbounds.push(inbound.build_inbound().await?);
-        }
-        for inbound in self.inbounds {
-            inbounds.push(inbound.build_inbound().await?);
-        }
-
-        if inbounds.is_empty() {
-            return Err(SError::SocksError("No inbound configured".to_string()));
         }
 
         let default_out = self
             .final_out
-            .or(self.final_out_legacy)
             .or(self.select_legacy);
 
-        let router = Router::new(self.rules, outbounds, default_out, self.log_outbound_stats)
-            .map_err(|e| SError::SocksError(e.to_string()))?;
+        let router = Router::new(
+            self.rules,
+            outbounds,
+            default_out,
+            self.log_outbound_stats,
+            self.mmdb,
+        )
+        .map_err(|e| SError::SocksError(e.to_string()))?;
 
-        Ok(Manager {
-            inbounds,
-            router: Arc::new(router),
-        })
+        let router = Arc::new(router);
+
+        let mut has_inbound = false;
+        if let Some(inbound) = self.inbound {
+            has_inbound = true;
+            inbound.start(router.clone()).await?;
+        }
+        for inbound in self.inbounds {
+            has_inbound = true;
+            inbound.start(router.clone()).await?;
+        }
+
+        if !has_inbound {
+            return Err(SError::SocksError("No inbound configured".to_string()));
+        }
+
+        Ok(())
     }
 }
 
@@ -114,6 +120,9 @@ pub struct Rule {
     pub inbound: Option<Vec<String>>,
     pub domain: Option<Vec<String>>,
     pub ip: Option<Vec<String>>,
+    pub geoip: Option<Vec<String>>,
+    #[serde(default)]
+    pub private_ip: bool,
     pub outbound: String,
 }
 
@@ -127,9 +136,8 @@ pub struct InboundCfg {
 }
 
 impl InboundCfg {
-    async fn build_inbound(self) -> Result<(String, Box<dyn Inbound>), SError> {
-        let inbound = self.inner.build_inbound().await?;
-        Ok((self.tag, inbound))
+    async fn start(self, router: Arc<Router>) -> Result<(), SError> {
+        self.inner.start(self.tag, router).await
     }
 }
 
@@ -178,14 +186,13 @@ pub enum InboundType {
     ShadowQuic(ShadowQuicServerCfg),
 }
 impl InboundType {
-    async fn build_inbound(self) -> Result<Box<dyn Inbound>, SError> {
-        let r: Box<dyn Inbound> = match self {
-            InboundType::Socks(cfg) => Box::new(SocksServer::new(cfg).await?),
-            InboundType::Http(cfg) => Box::new(HttpServer::new(cfg).await?),
-            InboundType::Tun(cfg) => Box::new(TunInbound::new(cfg)?),
-            InboundType::ShadowQuic(cfg) => Box::new(ShadowQuicServer::new(cfg)?),
-        };
-        Ok(r)
+    async fn start(self, tag: String, router: Arc<Router>) -> Result<(), SError> {
+        match self {
+            InboundType::Socks(cfg) => start_socks_inbound(tag, router, cfg).await,
+            InboundType::Http(cfg) => start_http_inbound(tag, router, cfg).await,
+            InboundType::Tun(cfg) => start_tun_inbound(tag, router, cfg),
+            InboundType::ShadowQuic(cfg) => start_shadowquic_inbound(tag, router, cfg).await,
+        }
     }
 }
 
@@ -210,18 +217,49 @@ pub enum OutboundCfg {
 impl OutboundCfg {
     async fn build_outbound(
         self,
+        tag: String,
         dns_map: &HashMap<String, DnsCfg>,
     ) -> Result<Box<dyn Outbound>, SError> {
         let r: Box<dyn Outbound> = match self {
-            OutboundCfg::Socks(cfg) => Box::new(SocksClient::new(cfg)),
-            OutboundCfg::ShadowQuic(cfg) => Box::new(ShadowQuicClient::new(cfg)),
-            OutboundCfg::Direct(mut cfg) => {
-                if let Some(tag) = cfg.dns_tag.clone() {
-                    if let Some(dns_cfg) = dns_map.get(&tag) {
-                        apply_dns_cfg(&mut cfg, dns_cfg);
-                    }
-                }
-                Box::new(DirectOut::new(cfg))
+            OutboundCfg::Socks(cfg) => Box::new(SocksClient::new(tag, cfg)),
+            OutboundCfg::ShadowQuic(cfg) => Box::new(ShadowQuicClient::new(tag, cfg)),
+            OutboundCfg::Direct(cfg) => {
+                let dns_cfg = if let Some(tag) = &cfg.dns_tag {
+                     dns_map.get(tag).cloned().unwrap_or(
+                        DnsCfg {
+                            tag: "default".to_string(),
+                            dns_strategy: DnsStrategy::default(),
+                            dns_over_https: None,
+                            dns_server: None,
+                            dns_cache_size: None,
+                            dns_memory_cache_capacity: None,
+                            dns_disk_cache_capacity: None,
+                            dns_disk_cache_path: None,
+                            dns_positive_min_ttl: None,
+                            dns_positive_max_ttl: None,
+                            dns_negative_min_ttl: None,
+                            dns_negative_max_ttl: None,
+                        }
+                     )
+                } else {
+                     dns_map.get("default").cloned().unwrap_or(
+                         DnsCfg {
+                            tag: "default".to_string(),
+                            dns_strategy: DnsStrategy::default(),
+                            dns_over_https: None,
+                            dns_server: None,
+                            dns_cache_size: None,
+                            dns_memory_cache_capacity: None,
+                            dns_disk_cache_capacity: None,
+                            dns_disk_cache_path: None,
+                            dns_positive_min_ttl: None,
+                            dns_positive_max_ttl: None,
+                            dns_negative_min_ttl: None,
+                            dns_negative_max_ttl: None,
+                        }
+                     )
+                };
+                Box::new(DirectOut::new(tag, cfg, dns_cfg).await)
             }
         };
         Ok(r)
@@ -430,18 +468,7 @@ pub enum CongestionControl {
 #[derive(Deserialize, Clone, Debug, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct DirectOutCfg {
-    #[serde(default)]
-    pub dns_strategy: DnsStrategy,
     pub dns_tag: Option<String>,
-    pub bind_interface: Option<String>,
-    pub dns_over_https: Option<DnsOverHttpsCfg>,
-    /// Upstream DNS server for classic UDP/TCP DNS, e.g. `udp://8.8.8.8:53`
-    pub dns_server: Option<String>,
-    pub dns_cache_size: Option<usize>,
-    pub dns_positive_min_ttl: Option<u64>,
-    pub dns_positive_max_ttl: Option<u64>,
-    pub dns_negative_min_ttl: Option<u64>,
-    pub dns_negative_max_ttl: Option<u64>,
 }
 /// DNS resolution strategy
 /// Default is `prefer-ipv4``
@@ -470,11 +497,18 @@ pub struct DnsOverHttpsCfg {
 pub struct DnsCfg {
     #[serde(default = "default_dns_tag")]
     pub tag: String,
-    #[serde(default)]
+    #[serde(default, rename = "strategy", alias = "dns-strategy")]
     pub dns_strategy: DnsStrategy,
     pub dns_over_https: Option<DnsOverHttpsCfg>,
+    #[serde(rename = "server", alias = "dns-server")]
     pub dns_server: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_byte_size")]
     pub dns_cache_size: Option<usize>,
+    #[serde(default, deserialize_with = "deserialize_byte_size")]
+    pub dns_memory_cache_capacity: Option<usize>,
+    #[serde(default, deserialize_with = "deserialize_byte_size")]
+    pub dns_disk_cache_capacity: Option<usize>,
+    pub dns_disk_cache_path: Option<String>,
     pub dns_positive_min_ttl: Option<u64>,
     pub dns_positive_max_ttl: Option<u64>,
     pub dns_negative_min_ttl: Option<u64>,
@@ -488,15 +522,54 @@ fn default_dns_tag() -> String {
 #[derive(Deserialize, Clone, Debug)]
 #[serde(rename_all = "kebab-case")]
 pub struct DnsCfgInner {
-    #[serde(default)]
+    #[serde(default, rename = "strategy", alias = "dns-strategy")]
     pub dns_strategy: DnsStrategy,
     pub dns_over_https: Option<DnsOverHttpsCfg>,
+    #[serde(rename = "server", alias = "dns-server")]
     pub dns_server: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_byte_size")]
     pub dns_cache_size: Option<usize>,
+    #[serde(default, deserialize_with = "deserialize_byte_size")]
+    pub dns_memory_cache_capacity: Option<usize>,
+    #[serde(default, deserialize_with = "deserialize_byte_size")]
+    pub dns_disk_cache_capacity: Option<usize>,
+    pub dns_disk_cache_path: Option<String>,
     pub dns_positive_min_ttl: Option<u64>,
     pub dns_positive_max_ttl: Option<u64>,
     pub dns_negative_min_ttl: Option<u64>,
     pub dns_negative_max_ttl: Option<u64>,
+}
+
+fn deserialize_byte_size<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum SizeOrStr {
+        Size(usize),
+        Str(String),
+    }
+
+    match Option::<SizeOrStr>::deserialize(deserializer)? {
+        Some(SizeOrStr::Size(s)) => Ok(Some(s)),
+        Some(SizeOrStr::Str(s)) => {
+            // Treat KB, MB, GB as KiB, MiB, GiB (binary units) to match common expectations in computing
+            let s_upper = s.to_uppercase();
+            let s_corrected = if !s_upper.contains("I") {
+                s_upper
+                    .replace("KB", "KIB")
+                    .replace("MB", "MIB")
+                    .replace("GB", "GIB")
+                    .replace("TB", "TIB")
+            } else {
+                s
+            };
+            let b = s_corrected.parse::<bytesize::ByteSize>().map_err(serde::de::Error::custom)?;
+            Ok(Some(b.as_u64() as usize))
+        }
+        None => Ok(None),
+    }
 }
 
 fn deserialize_dns<'de, D>(deserializer: D) -> Result<Vec<DnsCfg>, D::Error>
@@ -521,6 +594,9 @@ where
                 dns_over_https: inner.dns_over_https,
                 dns_server: inner.dns_server,
                 dns_cache_size: inner.dns_cache_size,
+                dns_memory_cache_capacity: inner.dns_memory_cache_capacity,
+                dns_disk_cache_capacity: inner.dns_disk_cache_capacity,
+                dns_disk_cache_path: inner.dns_disk_cache_path,
                 dns_positive_min_ttl: inner.dns_positive_min_ttl,
                 dns_positive_max_ttl: inner.dns_positive_max_ttl,
                 dns_negative_min_ttl: inner.dns_negative_min_ttl,
@@ -531,16 +607,7 @@ where
     Ok(dns)
 }
 
-fn apply_dns_cfg(target: &mut DirectOutCfg, dns_cfg: &DnsCfg) {
-    target.dns_strategy = dns_cfg.dns_strategy.clone();
-    target.dns_over_https = dns_cfg.dns_over_https.clone();
-    target.dns_server = dns_cfg.dns_server.clone();
-    target.dns_cache_size = dns_cfg.dns_cache_size;
-    target.dns_positive_min_ttl = dns_cfg.dns_positive_min_ttl;
-    target.dns_positive_max_ttl = dns_cfg.dns_positive_max_ttl;
-    target.dns_negative_min_ttl = dns_cfg.dns_negative_min_ttl;
-    target.dns_negative_max_ttl = dns_cfg.dns_negative_max_ttl;
-}
+
 
 #[derive(Deserialize, Clone, Debug)]
 #[serde(untagged)]

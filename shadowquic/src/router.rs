@@ -1,14 +1,14 @@
+use crate::Outbound;
 use crate::config::Rule;
 use crate::msgs::socks5::{AddrOrDomain, SocksAddr};
-use crate::Outbound;
 use anyhow::{Context, Result};
 use ipnet::IpNet;
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex;
-use tracing::warn;
+use tracing::{debug, warn};
 
 #[derive(Debug)]
 pub struct OutboundStats {
@@ -71,8 +71,9 @@ pub struct Router {
     rules: Vec<ParsedRule>,
     outbounds: HashMap<String, Arc<Mutex<Box<dyn Outbound>>>>,
     default_outbound: Arc<Mutex<Box<dyn Outbound>>>,
-    default_outbound_tag: String,
-    stats: HashMap<String, Arc<OutboundStats>>,
+    default_stats: Option<Arc<OutboundStats>>,
+    stats: Option<HashMap<String, Arc<OutboundStats>>>,
+    mmdb: Option<Arc<maxminddb::Reader<Vec<u8>>>>,
 }
 
 #[derive(Clone)]
@@ -80,8 +81,10 @@ struct ParsedRule {
     inbound: Option<Vec<String>>,
     domain_suffix: Option<Vec<String>>,
     ip_cidr: Option<Vec<IpNet>>,
+    geoip: Option<Vec<String>>,
+    private_ip: bool,
     outbound: Arc<Mutex<Box<dyn Outbound>>>,
-    outbound_tag: String,
+    stats: Option<Arc<OutboundStats>>,
 }
 
 impl Router {
@@ -90,28 +93,49 @@ impl Router {
         outbounds: HashMap<String, Arc<Mutex<Box<dyn Outbound>>>>,
         default_outbound_tag: Option<String>,
         enable_stats: bool,
+        mmdb_path: Option<String>,
     ) -> Result<Self> {
-        let (default_outbound_tag_value, default_outbound) =
-            if let Some(tag) = &default_outbound_tag {
-                let outbound = outbounds
-                    .get(tag)
-                    .cloned()
-                    .with_context(|| format!("Default outbound {} not found", tag))?;
-                (tag.clone(), outbound)
-            } else {
-                if outbounds.is_empty() {
-                    return Err(anyhow::anyhow!("No outbounds configured"));
-                }
-                let (tag, outbound) = outbounds.iter().next().unwrap();
-                (tag.clone(), outbound.clone())
-            };
+        let mmdb = if let Some(path) = mmdb_path {
+            let reader = maxminddb::Reader::open_readfile(path).context("Failed to open mmdb")?;
+            Some(Arc::new(reader))
+        } else {
+            None
+        };
 
-        let mut stats = HashMap::new();
-        if enable_stats {
-            for tag in outbounds.keys() {
-                stats.insert(tag.clone(), Arc::new(OutboundStats::new(tag.clone())));
+        if mmdb.is_none() {
+            for rule in &config_rules {
+                if rule.geoip.is_some() {
+                    return Err(anyhow::anyhow!(
+                        "GeoIP rule present but mmdb not configured"
+                    ));
+                }
             }
         }
+
+        let mut stats: Option<HashMap<String, Arc<OutboundStats>>> = None;
+        if enable_stats {
+            let mut s = HashMap::new();
+            for tag in outbounds.keys() {
+                s.insert(tag.clone(), Arc::new(OutboundStats::new(tag.clone())));
+            }
+            stats = Some(s);
+        }
+
+        let (default_outbound, default_stats) = if let Some(tag) = &default_outbound_tag {
+            let outbound = outbounds
+                .get(tag)
+                .cloned()
+                .with_context(|| format!("Default outbound {} not found", tag))?;
+            let s = stats.as_ref().and_then(|m| m.get(tag).cloned());
+            (outbound, s)
+        } else {
+            if outbounds.is_empty() {
+                return Err(anyhow::anyhow!("No outbounds configured"));
+            }
+            let (tag, outbound) = outbounds.iter().next().unwrap();
+            let s = stats.as_ref().and_then(|m| m.get(tag).cloned());
+            (outbound.clone(), s)
+        };
 
         let mut parsed_rules = Vec::new();
         for rule in config_rules {
@@ -141,12 +165,16 @@ impl Router {
                 Some(ip_cidrs)
             };
 
+            let rule_stats = stats.as_ref().and_then(|m| m.get(&rule.outbound).cloned());
+
             parsed_rules.push(ParsedRule {
                 inbound: rule.inbound,
                 domain_suffix: rule.domain,
                 ip_cidr,
+                geoip: rule.geoip,
+                private_ip: rule.private_ip,
                 outbound,
-                outbound_tag: rule.outbound,
+                stats: rule_stats,
             });
         }
 
@@ -154,21 +182,63 @@ impl Router {
             rules: parsed_rules,
             outbounds,
             default_outbound,
-            default_outbound_tag: default_outbound_tag_value,
+            default_stats,
             stats,
+            mmdb,
         })
+    }
+
+    fn is_private_ip(ip: IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local(),
+            IpAddr::V6(v6) => {
+                v6.is_loopback() || v6.is_unique_local() || v6.is_unicast_link_local()
+            }
+        }
+    }
+
+    fn match_ip_and_geo(&self, rule: &ParsedRule, ip: IpAddr) -> bool {
+        if let Some(cidrs) = &rule.ip_cidr {
+            if cidrs.iter().any(|cidr| cidr.contains(&ip)) {
+                return true;
+            }
+        }
+        if rule.private_ip && Self::is_private_ip(ip) {
+            return true;
+        }
+        if let Some(codes) = &rule.geoip
+            && let Some(mmdb) = &self.mmdb
+        {
+            let iso_code = match mmdb.lookup::<maxminddb::geoip2::Country>(ip) {
+                Ok(country) => country
+                    .country
+                    .and_then(|c| c.iso_code)
+                    .map(|s| s.to_string().to_lowercase()),
+                Err(_) => None,
+            };
+            if let Some(iso) = iso_code {
+                if codes.iter().any(|code| code.to_lowercase() == iso) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     pub fn route(
         &self,
         inbound_tag: &str,
         req: &crate::ProxyRequest,
-    ) -> (Arc<Mutex<Box<dyn Outbound>>>, Option<Arc<OutboundStats>>) {
+    ) -> (
+        Arc<Mutex<Box<dyn Outbound>>>,
+        Option<Arc<OutboundStats>>,
+        Option<usize>,
+    ) {
         let dst = match req {
             crate::ProxyRequest::Tcp(s) => &s.dst,
             crate::ProxyRequest::Udp(s) => &s.dst,
         };
-        for rule in &self.rules {
+        for (idx, rule) in self.rules.iter().enumerate() {
             if let Some(inbounds) = &rule.inbound {
                 if !inbounds.iter().any(|t| t == inbound_tag) {
                     continue;
@@ -182,39 +252,64 @@ impl Router {
                         if !suffixes.iter().any(|s| domain.ends_with(s)) {
                             continue;
                         }
-                    }
-                    if rule.ip_cidr.is_some() {
+                    } else {
                         continue;
                     }
                 }
                 AddrOrDomain::V4(x) => {
-                    if rule.domain_suffix.is_some() {
+                    let ip = IpAddr::from(*x);
+                    if !self.match_ip_and_geo(rule, ip) {
                         continue;
-                    }
-                    if let Some(cidrs) = &rule.ip_cidr {
-                        let ip = IpAddr::from(*x);
-                        if !cidrs.iter().any(|cidr| cidr.contains(&ip)) {
-                            continue;
-                        }
                     }
                 }
                 AddrOrDomain::V6(x) => {
-                    if rule.domain_suffix.is_some() {
+                    let ip = IpAddr::from(*x);
+                    if !self.match_ip_and_geo(rule, ip) {
                         continue;
-                    }
-                    if let Some(cidrs) = &rule.ip_cidr {
-                        let ip = IpAddr::from(*x);
-                        if !cidrs.iter().any(|cidr| cidr.contains(&ip)) {
-                            continue;
-                        }
                     }
                 }
             }
 
-            let stats = self.stats.get(&rule.outbound_tag).cloned();
-            return (rule.outbound.clone(), stats);
+            return (rule.outbound.clone(), rule.stats.clone(), Some(idx));
         }
-        let stats = self.stats.get(&self.default_outbound_tag).cloned();
-        (self.default_outbound.clone(), stats)
+        return (
+            self.default_outbound.clone(),
+            self.default_stats.clone(),
+            None,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn test_private_ip_detection_common_ranges() {
+        let private_ips = [
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+            IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1)),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            IpAddr::V6("fc00::1".parse().unwrap()),
+            IpAddr::V6("fe80::1".parse().unwrap()),
+        ];
+
+        for ip in private_ips {
+            assert!(Router::is_private_ip(ip), "expected {ip} to be private");
+        }
+
+        let public_ips = [
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+            IpAddr::V6("2001:4860:4860::8888".parse().unwrap()),
+        ];
+
+        for ip in public_ips {
+            assert!(!Router::is_private_ip(ip), "expected {ip} to be public");
+        }
     }
 }
